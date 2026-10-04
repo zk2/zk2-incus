@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# Issue an OpenVPN client: certificate and a ready .ovpn in one file.
+# Runs INSIDE the openvpn instance (set up by zk2-vpn-setup).
+#
+# Usage: zk2-vpn-add NAME
+#
+# The config lands in /root/vpn_configs/NAME.ovpn, mode 600. It contains the
+# client's private key: hand it over through a secure channel and do not keep
+# it longer than needed.
+#
+# Lessons kept here:
+# - easyrsa's exit code is checked and its output shown: a failed issue used
+#   to produce a .ovpn with EMPTY <cert> and <key> sections, printed as if
+#   nothing happened.
+# - The port comes from server.conf, the address from zk2-vpn.conf: they
+#   must not drift apart.
+# - Compression is copied from server.conf: a client that compresses sends a
+#   header byte the server does not expect, and the tunnel comes up while no
+#   data passes.
+
+set -euo pipefail
+
+SRV=/etc/openvpn/server
+OUT_DIR=${OUT_DIR:-/root/vpn_configs}
+export EASYRSA_PKI=/etc/openvpn/easy-rsa/pki EASYRSA_BATCH=1
+die() { echo "$*" >&2; exit 1; }
+
+NAME=${1:-}
+[ -n "$NAME" ] || die "usage: $(basename "$0") NAME"
+# The name goes into file names and the CN.
+case "$NAME" in *[!A-Za-z0-9._-]*|server) die "name: letters, digits, dot, dash, underscore; not 'server'" ;; esac
+
+[ -r /etc/openvpn/zk2-vpn.conf ] || die "no /etc/openvpn/zk2-vpn.conf - run zk2-vpn-setup first"
+# shellcheck source=/dev/null
+. /etc/openvpn/zk2-vpn.conf
+: "${REMOTE_HOST:?REMOTE_HOST is not set in /etc/openvpn/zk2-vpn.conf}"
+# easyrsa: in PATH, or where Debian (/usr/share/easy-rsa) or the RHEL family
+# (/usr/share/easy-rsa/3) put it.
+EASYRSA=""
+for c in "$(command -v easyrsa || true)" /usr/share/easy-rsa/easyrsa /usr/share/easy-rsa/3/easyrsa; do
+    if [ -n "$c" ] && [ -x "$c" ]; then EASYRSA=$c; break; fi
+done
+[ -x "$EASYRSA" ] || die "easyrsa not found"
+[ -d "$EASYRSA_PKI" ] || die "no PKI in ${EASYRSA_PKI}"
+PORT=$(awk '$1 == "port" { print $2; exit }' "${SRV}/server.conf")
+[ -n "$PORT" ] || die "no port in ${SRV}/server.conf"
+[ ! -f "${EASYRSA_PKI}/issued/${NAME}.crt" ] || die "${NAME} is already issued: ${EASYRSA_PKI}/issued/${NAME}.crt"
+
+"$EASYRSA" build-client-full "$NAME" nopass
+
+CRT="${EASYRSA_PKI}/issued/${NAME}.crt" KEY="${EASYRSA_PKI}/private/${NAME}.key"
+for f in "$CRT" "$KEY" "${SRV}/ca.crt" "${SRV}/ta.key"; do
+    [ -s "$f" ] || die "after issuing, ${f} is missing or empty"
+done
+if grep -qE '^[[:space:]]*comp-lzo' "${SRV}/server.conf"; then COMP=comp-lzo; else COMP="allow-compression no"; fi
+
+mkdir -p "$OUT_DIR" && chmod 700 "$OUT_DIR"
+OUT="${OUT_DIR}/${NAME}.ovpn"
+umask 077
+{
+    printf '%s\n' client tls-client "dev tun" "proto udp" "remote ${REMOTE_HOST} ${PORT}" \
+        "resolv-retry infinite" nobind persist-key persist-tun "remote-cert-tls server" "verb 3" "$COMP"
+    echo "<ca>";       cat "${SRV}/ca.crt"; echo "</ca>"
+    echo "<cert>";     cat "$CRT";          echo "</cert>"
+    echo "<key>";      cat "$KEY";          echo "</key>"
+    echo "key-direction 1"
+    echo "<tls-auth>"; cat "${SRV}/ta.key"; echo "</tls-auth>"
+} > "$OUT"
+chmod 600 "$OUT"
+echo "done: ${OUT}"
+echo "It holds the private key: hand it over securely, then delete it here."

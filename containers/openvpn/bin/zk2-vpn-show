@@ -1,0 +1,166 @@
+#!/bin/bash
+#
+# The whole OpenVPN picture in this instance: config, certificates,
+# revocation list, who is connected, and what is wrong. Read-only.
+#
+# Usage: zk2-vpn-show [NAME]     everything, or one client in detail
+#
+# The PROBLEMS section collects checks for things that already failed
+# silently once: a revocation that does not work, a list nobody can read, an
+# expiring list (which cuts off everyone), certificates outside the index
+# (nothing to revoke them with), the CA key next to the service, handed-out
+# configs with revoked certificates.
+
+set -uo pipefail
+
+SRV=/etc/openvpn/server
+PKI=/etc/openvpn/easy-rsa/pki
+OUT_DIR=${OUT_DIR:-/root/vpn_configs}
+CONF=${SRV}/server.conf
+STATUS=/var/log/openvpn-status.log
+UNIT=openvpn-server@server
+WARN_DAYS=${WARN_DAYS:-30}
+
+problems=()
+note() { problems+=("$1"); }
+hr() { printf '\n== %s\n' "$1"; }
+cfg() { awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print; exit }' "$CONF" 2>/dev/null; }
+
+# index.txt dates: 281106143638Z -> 2028-11-06 14:36:38
+ts_to_date() {
+    local t=${1%Z} cent=20
+    [ "${t:0:2}" -ge 70 ] 2>/dev/null && cent=19
+    printf '%s%s-%s-%s %s:%s:%s' "$cent" "${t:0:2}" "${t:2:2}" "${t:4:2}" "${t:6:2}" "${t:8:2}" "${t:10:2}"
+}
+days_left() {
+    local when
+    when=$(date -u -d "$(ts_to_date "$1")" +%s 2>/dev/null) || { echo "?"; return; }
+    echo $(( (when - $(date -u +%s)) / 86400 ))
+}
+# Readable by nobody: o+x on every directory of the path and o+r on the file.
+readable_by_nobody() {
+    local p mode
+    p=$(dirname "$1")
+    while :; do
+        mode=$(stat -c %a "$p" 2>/dev/null) || return 1
+        [ $(( 0$mode & 1 )) -ne 0 ] || return 1
+        [ "$p" = / ] && break
+        p=$(dirname "$p")
+    done
+    mode=$(stat -c %a "$1" 2>/dev/null) || return 1
+    [ $(( 0$mode & 4 )) -ne 0 ]
+}
+
+crl=$(cfg crl-verify)
+case "$crl" in ""|/*) ;; *) crl="${SRV}/${crl}" ;; esac
+crl_serials=""
+[ -n "$crl" ] && [ -r "$crl" ] && crl_serials=$(openssl crl -in "$crl" -noout -text 2>/dev/null | awk '/Serial Number:/ { print $3 }')
+
+if [ $# -ge 1 ]; then
+    name=$1
+    hr "CLIENT ${name}"
+    line=$(awk -F'\t' -v n="/CN=${name}" '$6 == n' "${PKI}/index.txt" 2>/dev/null | tail -1)
+    if [ -z "$line" ]; then
+        echo "  not in the index"
+    else
+        st=$(cut -f1 <<<"$line"); exp=$(cut -f2 <<<"$line"); rev=$(cut -f3 <<<"$line"); ser=$(cut -f4 <<<"$line")
+        printf '  status:   %s\n' "$([ "$st" = V ] && echo valid || echo "REVOKED $(ts_to_date "$rev")")"
+        printf '  serial:   %s\n  expires:  %s (%s days)\n' "$ser" "$(ts_to_date "$exp")" "$(days_left "$exp")"
+        [ -z "$crl_serials" ] || printf '  in the revocation list: %s\n' "$(grep -qx "$ser" <<<"$crl_serials" && echo yes || echo no)"
+    fi
+    [ -f "${OUT_DIR}/${name}.ovpn" ] && printf '  config:   %s (%s)\n' "${OUT_DIR}/${name}.ovpn" "$(stat -c %A "${OUT_DIR}/${name}.ovpn")"
+    if [ -r "$STATUS" ]; then
+        cur=$(awk -F, -v n="$name" '$1 == "CLIENT_LIST" && $2 == n' "$STATUS")
+        if [ -n "$cur" ]; then
+            printf '  CONNECTED from %s, address %s, since %s\n' "$(cut -d, -f3 <<<"$cur")" "$(cut -d, -f4 <<<"$cur")" "$(cut -d, -f8 <<<"$cur")"
+        else
+            echo "  not connected"
+        fi
+    fi
+    exit 0
+fi
+
+hr "SERVER"
+printf '  %s\n' "$(openvpn --version 2>/dev/null | head -1)"
+printf '  unit:      %s\n' "$(systemctl is-active "$UNIT" 2>/dev/null || echo unknown)"
+printf '  listening: %s\n' "$(ss -lnup 2>/dev/null | awk '/openvpn/ { print $5 }' | tr '\n' ' ')"
+for k in port proto topology server push crl-verify user group data-ciphers allow-compression comp-lzo; do
+    v=$(cfg "$k"); [ -z "$v" ] || printf '  %-18s %s\n' "$k" "$v"
+done
+
+hr "CERTIFICATES (${PKI}/index.txt)"
+if [ -r "${PKI}/index.txt" ]; then
+    printf '  %-2s %-20s %-11s %6s  %s\n' "" CN expires days serial
+    # awk, not read with IFS=tab: tabs are whitespace for read, and the empty
+    # revocation-date field of valid entries would shift every column.
+    while IFS='|' read -r st exp ser cn; do
+        left=$(days_left "$exp"); mark=" "
+        if [ "$st" = R ]; then mark=R
+        elif [ "$left" != "?" ] && [ "$left" -lt "$WARN_DAYS" ]; then mark="!"; note "certificate ${cn} expires in ${left} days"; fi
+        printf '  %-2s %-20s %-11s %6s  %s\n' "$mark" "$cn" "$(ts_to_date "$exp" | cut -d' ' -f1)" "$left" "$ser"
+    done < <(awk -F'\t' 'NF { sub(/^.*CN=/, "", $6); print $1 "|" $2 "|" $4 "|" $6 }' "${PKI}/index.txt")
+    echo "  R revoked, ! expires soon"
+else
+    echo "  no index"; note "no ${PKI}/index.txt - nothing can be issued or revoked"
+fi
+
+hr "REVOCATION LIST"
+if [ -z "$crl" ]; then
+    echo "  crl-verify is NOT set"; note "without crl-verify revocation does not work: revoked clients keep connecting"
+elif [ ! -r "$crl" ]; then
+    echo "  ${crl}: missing"; note "crl-verify points to ${crl}, which is missing: the server will not start"
+else
+    nu=$(openssl crl -in "$crl" -noout -nextupdate 2>/dev/null | cut -d= -f2)
+    nleft=$(( ( $(date -u -d "$nu" +%s) - $(date -u +%s) ) / 86400 ))
+    printf '  file:      %s (%s)\n  revoked:   %s\n  valid to:  %s (%s days)\n' \
+        "$crl" "$(stat -c %A "$crl")" "$(grep -c . <<<"$crl_serials" || true)" "$nu" "$nleft"
+    [ "$nleft" -ge "$WARN_DAYS" ] || note "the revocation list expires in ${nleft} days - then the server refuses EVERY client (zk2-vpn-revoke reissues it; easyrsa gen-crl does too)"
+    if readable_by_nobody "$crl"; then echo "  for nobody: readable"
+    else echo "  for nobody: NOT READABLE"; note "the revocation list is not readable by nobody: it is re-read on every connection without privileges, and new revocations do not apply until a restart"; fi
+fi
+
+hr "CONNECTED NOW"
+if [ -r "$STATUS" ]; then
+    n=0
+    while IFS=, read -r tag cn real virt _ rx tx since _; do
+        [ "$tag" = CLIENT_LIST ] || continue
+        n=$(( n + 1 ))
+        printf '  %-18s %-22s %-14s in %-10s out %-10s since %s\n' "$cn" "$real" "$virt" "$rx" "$tx" "$since"
+    done < "$STATUS"
+    [ "$n" != 0 ] || echo "  nobody"
+    echo "  (the status file is updated every 60 seconds)"
+else
+    echo "  no ${STATUS}"
+fi
+
+srv_cert=$(cfg cert)
+case "$srv_cert" in /*) ;; *) srv_cert="${SRV}/${srv_cert}" ;; esac
+if [ -r "$srv_cert" ]; then
+    s=$(openssl x509 -in "$srv_cert" -noout -serial 2>/dev/null | cut -d= -f2)
+    [ -z "$crl_serials" ] || ! grep -qx "$s" <<<"$crl_serials" || note "the SERVER certificate ${srv_cert} is itself revoked"
+    e=$(openssl x509 -in "$srv_cert" -noout -enddate | cut -d= -f2)
+    el=$(( ( $(date -u -d "$e" +%s) - $(date -u +%s) ) / 86400 ))
+    [ "$el" -ge "$WARN_DAYS" ] || note "the server certificate expires in ${el} days"
+else
+    note "the server certificate ${srv_cert} is missing"
+fi
+# Certificates the server has but the index does not know: signed past
+# easy-rsa, and there is nothing to revoke them with.
+if [ -d "${SRV}/issued" ] && [ -r "${PKI}/index.txt" ]; then
+    for f in "${SRV}"/issued/*.crt; do
+        [ -e "$f" ] || continue
+        s=$(openssl x509 -in "$f" -noout -serial 2>/dev/null | cut -d= -f2)
+        grep -q "$s" "${PKI}/index.txt" || note "$(basename "$f") is NOT in the index - nothing can revoke it"
+    done
+fi
+[ ! -e "${SRV}/private/ca.key" ] || note "the CA key is in ${SRV}/private/ - it belongs in the PKI only"
+if [ -d "$OUT_DIR" ] && [ -n "$crl_serials" ]; then
+    for f in "$OUT_DIR"/*.ovpn; do
+        [ -e "$f" ] || continue
+        s=$(sed -n '/<cert>/,/<\/cert>/p' "$f" | sed '1d;$d' | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2)
+        [ -z "$s" ] || ! grep -qx "$s" <<<"$crl_serials" || note "$(basename "$f") in ${OUT_DIR} holds a REVOKED certificate"
+    done
+fi
+
+hr "PROBLEMS"
+if [ ${#problems[@]} -eq 0 ]; then echo "  none found"; else for p in "${problems[@]}"; do printf '  * %s\n' "$p"; done; fi
