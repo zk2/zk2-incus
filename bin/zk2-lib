@@ -240,3 +240,26 @@ zk2_net_defaults() {
     read -r n _ _ < <(zk2_net "$CT_NET") || zk2_die "CT_NET='${CT_NET}' is not a network like 10.20.0.0/24"
     CT_GATEWAY=${CT_GATEWAY:-$(zk2_int2ip $(( n + 1 )))}
 }
+
+# zk2_ct_unpin NAME - make an imported COPY safe to start next to its
+# original: an export carries the original's MAC addresses
+# (volatile.DEV.hwaddr) and fixed IP addresses. Incus refuses ANY config
+# change of such a copy while its MAC collides ("MAC address ... already
+# defined on another NIC"), so the MACs go first - Incus generates new ones -
+# and the addresses after. boot.autostart=false: a copy must not come up by
+# itself after a reboot. The result is read back, not trusted from exit codes.
+zk2_ct_unpin() {
+    local ct=$1 dev left=""
+    for dev in $(incus query "/1.0/instances/${ct}" </dev/null | jq -r '.devices // {} | to_entries[] | select(.value.type == "nic") | .key'); do
+        incus config unset "$ct" "volatile.${dev}.hwaddr" </dev/null >/dev/null 2>&1 || true
+        incus config device unset "$ct" "$dev" ipv4.address </dev/null >/dev/null 2>&1 || true
+        incus config device unset "$ct" "$dev" ipv6.address </dev/null >/dev/null 2>&1 || true
+        [ -z "$(incus config device get "$ct" "$dev" ipv4.address </dev/null 2>/dev/null)" ] || left+=" ${dev}"
+    done
+    incus config set "$ct" boot.autostart=false </dev/null
+    if [ -n "$left" ]; then
+        zk2_err "  ${ct}: fixed address still set on${left} - do not start it next to the original"
+        return 1
+    fi
+    zk2_log "  ${ct}: new MAC, fixed address dropped, boot.autostart=false"
+}

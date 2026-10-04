@@ -236,13 +236,9 @@ restore_vm_export() {
         rm -rf "$tmp"; zk2_err "  incus import failed"; return 1
     fi
     rm -rf "$tmp"
-    # An export carries the configuration of the instance, address included.
-    # A probe must neither take the address nor start by itself.
-    if [ -n "$AS_NAME" ]; then
-        incus config device override "$target" eth0 ipv4.address= </dev/null >/dev/null 2>&1 \
-            || incus config device unset "$target" eth0 ipv4.address </dev/null >/dev/null 2>&1 || true
-        incus config set "$target" boot.autostart=false </dev/null
-    fi
+    # An export carries the configuration of the instance, MAC and address
+    # included. A probe must take neither, nor start by itself.
+    [ -z "$AS_NAME" ] || zk2_ct_unpin "$target" || true
     zk2_ok "  ${target} imported (whole VM); start it with: incus start ${target}"
 }
 
