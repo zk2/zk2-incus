@@ -1,0 +1,10 @@
+# Per-node secrets: never in git
+zk2-env
+
+# Private keys and PKI
+**/*.key
+**/*.pem
+**/*.p12
+
+.idea/
+.vscode/
