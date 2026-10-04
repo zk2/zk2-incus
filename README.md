@@ -163,16 +163,55 @@ the subject, so a missing mail is a signal too; `MAIL_WHEN=problems` in
 
 ### On the day of a disaster
 
-Build the node anew, deploy it, put `zk2-env` back (from your password
-manager, or from the host archive of another copy), then:
+What you need: the borg repository, your fleet repository, a zk2 checkout,
+and the borg passphrase from your password manager. Everything else - the
+real `zk2-env`, the limits of every instance - comes back from the archives.
+The whole sequence below was rehearsed on a test node rebuilt from nothing.
 
-```sh
-zk2-archives                                    # what there is, how fresh
-mkdir -p /root/restore && cd /root/restore
-(set -a; . /etc/zk2/zk2-env; borg extract "::$(borg list --glob-archives '_host@*' --last 1 --format '{archive}')" var/lib/zk2/host-state)
-zk2-restore wave 1 --config /root/restore/var/lib/zk2/host-state/instances.json
-zk2-restore wave 2 --config /root/restore/var/lib/zk2/host-state/instances.json
-```
+1. Build the node anew (see "A new node"): install Debian 13, `apt install
+   rsync`, `zk2-deploy NODE`, `zk2-node-build`.
+
+2. A new borg key. The old one died with the node; authorize the new one on
+   the repository side and drop the old line:
+
+   ```sh
+   ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519_borg -C "borg@$(hostname)"
+   cat /root/.ssh/id_ed25519_borg.pub     # -> authorized_keys of the repository
+   ```
+
+3. A temporary `zk2-env` of three lines - enough to read the repository:
+
+   ```sh
+   cat > /etc/zk2/zk2-env <<'EOF'
+   BORG_REPO=ssh://...
+   BORG_RSH="ssh -i /root/.ssh/id_ed25519_borg -o IdentitiesOnly=yes"
+   BORG_PASSPHRASE="..."
+   EOF
+   chmod 600 /etc/zk2/zk2-env
+   zk2-archives          # what there is, how fresh; confirm the repository's host key
+   ```
+
+4. The real `zk2-env` and the state dump from the newest host archive:
+
+   ```sh
+   mkdir -p /root/restore && cd /root/restore
+   (set -a; . /etc/zk2/zk2-env
+    borg extract "::$(borg list --glob-archives '_host@*' --last 1 --format '{archive}')" \
+        etc/zk2/zk2-env var/lib/zk2/host-state)
+   cp etc/zk2/zk2-env /etc/zk2/zk2-env && chmod 600 /etc/zk2/zk2-env
+   ```
+
+5. Profile, published ports, then the instances wave by wave:
+
+   ```sh
+   zk2-base-profile
+   zk2-publish apply
+   zk2-restore wave 1 --config /root/restore/var/lib/zk2/host-state/instances.json
+   zk2-restore wave 2 --config /root/restore/var/lib/zk2/host-state/instances.json
+   ```
+
+6. Check and carry on: `zk2-health`, then `zk2-nightly --no-mail` - new
+   archives go into the same repository, and the history continues.
 
 `--config` gives the instances back their limits and root sizes, which live
 in the Incus database and not in the archives.
