@@ -1,0 +1,127 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR disable=SC2001
+#
+# The zk2 shell setup in instances: /etc/profile.d/zk2.sh (history, coloured
+# prompt) and no foreign PS1 overriding it.
+#
+#   zk2-shell                 every instance of the node
+#   zk2-shell NAME [NAME...]  only these
+#   zk2-shell --check         show what is there, change nothing
+#
+# Why apart from cloud-init: the profile base sets this up once, on the
+# first start. Instances created before a change of base.yaml, and those
+# brought in by zk2-restore or from another system, never get it from the
+# profile.
+#
+# What it does:
+#
+# 1. /etc/profile.d/zk2.sh with the text from cloud-init/base.yaml (there is
+#    no second copy to keep in sync). A different old file stays as zk2.sh.bak.
+# 2. In /etc/skel/.bashrc, /root/.bashrc and /home/*/.bashrc, assignments of
+#    PS1, HISTSIZE and HISTFILESIZE at the start of a line become ":" with a
+#    comment. ~/.bashrc runs AFTER /etc/profile.d and overrides zk2.sh;
+#    Debian's skel always does. ":" rather than a comment: the lines sit
+#    inside if/else and case, and an empty branch is a syntax error. The file
+#    is saved as .bashrc.zk2-bak once, checked with bash -n after the change,
+#    and put back when the check fails.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus awk
+
+YAML=${ZK2_BASE_YAML:-$(dirname "$(readlink -f "$0")")/../cloud-init/base.yaml}
+
+CHECK=0; NAMES=()
+for a in "$@"; do
+    case "$a" in
+        --check) CHECK=1 ;;
+        -h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) zk2_die "unknown option: $a" ;;
+        *) NAMES+=("$a") ;;
+    esac
+done
+
+[ -r "$YAML" ] || zk2_die "no ${YAML} (zk2-deploy delivers it)"
+
+# The content block of the write_files entry for /etc/profile.d/zk2.sh.
+ZKSH=$(awk '
+    /^ *- path: \/etc\/profile\.d\/zk2\.sh *$/ { inpath = 1; next }
+    inpath && /^ *content: *\| *$/ { match($0, /^ */); ind = RLENGTH; inblock = 1; inpath = 0; next }
+    inblock {
+        if ($0 ~ /^ *$/) { buf = buf "\n"; next }
+        match($0, /^ */)
+        if (RLENGTH <= ind) exit
+        printf "%s", buf; buf = ""
+        print substr($0, ind + 3)
+    }' "$YAML")
+grep -q 'PS1=' <<<"$ZKSH" || zk2_die "no /etc/profile.d/zk2.sh block with PS1 in ${YAML} - parsing broke"
+
+if [ "${#NAMES[@]}" -eq 0 ]; then
+    mapfile -t NAMES < <(zk2_ct_names)
+fi
+[ "${#NAMES[@]}" -gt 0 ] || zk2_die "no instances on this node"
+
+# The work inside the instance; the zk2.sh text comes on stdin, results come
+# back as ZK2:* lines.
+# shellcheck disable=SC2016
+INNER='set -u
+F=/etc/profile.d/zk2.sh
+RE="^([[:space:]]*)((export[[:space:]]+)?(PS1|HISTSIZE|HISTFILESIZE)=)"
+new=$(mktemp); cat > "$new"
+if cmp -s "$new" "$F"; then echo "ZK2:SH ok"
+elif [ "$ZK2_APPLY" = 0 ]; then
+    if [ -e "$F" ]; then echo "ZK2:SH differs"; else echo "ZK2:SH missing"; fi
+else
+    [ -e "$F" ] && cp -p "$F" "${F}.bak"
+    cp "$new" "$F"; chmod 644 "$F"; chown root:root "$F"
+    echo "ZK2:SH written"
+fi
+rm -f "$new"
+for f in /etc/skel/.bashrc /root/.bashrc /home/*/.bashrc; do
+    [ -f "$f" ] || continue
+    grep -qE "$RE" "$f" || continue
+    if [ "$ZK2_APPLY" = 0 ]; then grep -nE "$RE" "$f" | sed "s|^|ZK2:HIT ${f}:|"; continue; fi
+    [ -f "${f}.zk2-bak" ] || cp -p "$f" "${f}.zk2-bak"
+    keep=$(mktemp); cp -p "$f" "$keep"
+    sed -i -E "s/${RE}/\\1: # zk2.sh: \\2/" "$f"
+    if bash -n "$f" 2>/dev/null; then echo "ZK2:FIXED ${f}"; else cp -p "$keep" "$f"; echo "ZK2:BADSYNTAX ${f}"; fi
+    rm -f "$keep"
+done'
+
+FAIL=0; SKIP=0; DONE=0
+for ct in "${NAMES[@]}"; do
+    zk2_ct_exists "$ct" || { zk2_err "${ct}: no such instance"; FAIL=$(( FAIL + 1 )); continue; }
+    if ! zk2_ct_running "$ct"; then
+        zk2_warn "${ct}: stopped - skipped, run again after it starts"; SKIP=$(( SKIP + 1 )); continue
+    fi
+    if ! incus exec "$ct" -- true </dev/null >/dev/null 2>&1; then
+        zk2_warn "${ct}: no way in (a VM without its agent?)"; SKIP=$(( SKIP + 1 )); continue
+    fi
+    if ! out=$(printf '%s\n' "$ZKSH" | incus exec "$ct" --env "ZK2_APPLY=$(( 1 - CHECK ))" -- sh -c "$INNER" 2>&1); then
+        zk2_err "${ct}: incus exec failed"; sed 's/^/    /' <<<"$out" >&2; FAIL=$(( FAIL + 1 )); continue
+    fi
+    sh=$(sed -n 's/^ZK2:SH //p' <<<"$out")
+    hits=$(sed -n 's/^ZK2:HIT //p' <<<"$out")
+    fixed=$(sed -n 's/^ZK2:FIXED //p' <<<"$out")
+    bad=$(sed -n 's/^ZK2:BADSYNTAX //p' <<<"$out")
+    if [ -n "$bad" ]; then
+        zk2_err "${ct}: bash -n failed after the change, file put back:"; sed 's/^/    /' <<<"$bad" >&2
+        FAIL=$(( FAIL + 1 ))
+    elif [ "$CHECK" = 1 ]; then
+        if [ "$sh" = ok ] && [ -z "$hits" ]; then
+            zk2_ok "${ct}: zk2.sh in place, nothing overrides it"; DONE=$(( DONE + 1 ))
+        else
+            zk2_warn "${ct}: zk2.sh ${sh}${hits:+, overridden by:}"
+            [ -z "$hits" ] || sed 's/^/    /' <<<"$hits" >&2
+            FAIL=$(( FAIL + 1 ))
+        fi
+    else
+        zk2_ok "${ct}: zk2.sh ${sh}${fixed:+, fixed: $(tr '\n' ' ' <<<"$fixed")}"; DONE=$(( DONE + 1 ))
+    fi
+done
+
+zk2_log "done: ${DONE}, skipped: ${SKIP}, with findings: ${FAIL}"
+# A skipped instance is "not reached", not "all is well".
+[ "$SKIP" = 0 ] || zk2_log "skipped instances are not set up"
+[ "$FAIL" = 0 ]
