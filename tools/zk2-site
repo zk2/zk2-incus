@@ -1,0 +1,88 @@
+#!/bin/bash
+#
+# Your site: the private repository that holds your nodes. Runs on the
+# WORKSTATION.
+#
+# Usage: zk2-site init DIR          create a site in DIR (new or empty)
+#        zk2-site add-node NAME     add nodes/NAME from examples/node
+#
+# A site is a directory with a zk2-site.conf marker and nodes/<name>/ inside.
+# Keep it in its own private git repository, next to your zk2 checkout or
+# with zk2 as a submodule - never inside the zk2 checkout, where it would show
+# up in zk2's git status and could end up in a pull request.
+#
+# add-node finds the site the same way zk2-deploy does: from the current
+# directory upwards, or ZK2_SITE.
+
+set -euo pipefail
+
+ZK2_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+find_site() {
+    local d
+    if [ -n "${ZK2_SITE:-}" ]; then
+        [ -r "${ZK2_SITE}/zk2-site.conf" ] || die "ZK2_SITE=${ZK2_SITE}: no zk2-site.conf there"
+        (cd "$ZK2_SITE" && pwd)
+        return
+    fi
+    d=$(pwd)
+    while [ "$d" != / ]; do
+        [ -r "${d}/zk2-site.conf" ] && { echo "$d"; return; }
+        d=$(dirname "$d")
+    done
+    die "no zk2-site.conf in $(pwd) or above; create a site first: zk2-site init DIR"
+}
+
+cmd_init() {
+    local dir=${1:?usage: zk2-site init DIR}
+    if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+        die "${dir} exists and is not empty"
+    fi
+    dir=$(realpath -m "$dir")
+    case "$dir/" in
+        "$ZK2_HOME"/*) die "${dir} is inside the zk2 checkout; put the site next to it" ;;
+    esac
+    mkdir -p "${dir}/nodes"
+
+    cat > "${dir}/zk2-site.conf" <<'EOF'
+# Marks the root of a zk2 site: zk2-deploy and zk2-site look for this file
+# from the current directory upwards. Nothing is read from it yet.
+EOF
+    cat > "${dir}/.gitignore" <<'EOF'
+# Secrets live on the nodes (/etc/zk2/zk2-env), never in the site repository.
+zk2-env
+*.key
+*.pem
+*.p12
+EOF
+    say "site created: ${dir}"
+    say
+    say "next:"
+    say "  cd ${dir} && git init"
+    say "  ${ZK2_HOME}/tools/zk2-site add-node NAME"
+}
+
+cmd_add_node() {
+    local name=${1:?usage: zk2-site add-node NAME} site
+    case "$name" in
+        */*|.*|'') die "bad node name: ${name}" ;;
+    esac
+    site=$(find_site)
+    [ -e "${site}/nodes/${name}" ] && die "nodes/${name} already exists"
+    cp -r "${ZK2_HOME}/examples/node" "${site}/nodes/${name}"
+    say "added: ${site}/nodes/${name}"
+    say
+    say "edit before the first deploy:"
+    say "  nodes/${name}/node.conf     addresses, bridge, networks; SSH_HOST if the"
+    say "                               ssh alias differs from '${name}'"
+    say "  nodes/${name}/publication/  what is published and to whom (example data!)"
+}
+
+case "${1:-}" in
+    init)     shift; cmd_init "$@" ;;
+    add-node) shift; cmd_add_node "$@" ;;
+    *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

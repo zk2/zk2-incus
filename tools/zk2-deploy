@@ -1,0 +1,309 @@
+#!/bin/bash
+#
+# Deliver zk2 and a node's data to the node. Runs on the WORKSTATION.
+#
+# Usage: zk2-deploy [--dry-run] NODE          code and node data
+#        zk2-deploy [--dry-run] NODE ROLE     config of one container role
+#        zk2-deploy --list                    nodes of the site
+#
+# Two repositories meet here:
+#
+#   zk2    this repository, code only. The code delivered is the one from the
+#          checkout this script lives in, so a zk2 next to your site and a
+#          zk2 as a submodule of your site both work without configuration.
+#   site   your private repository with nodes/<NODE>/. Found by walking up
+#          from the current directory to a zk2-site.conf (ZK2_SITE overrides).
+#          A marker file rather than a nodes/ directory, because a nodes/
+#          directory alone is too common a name to be trusted.
+#
+# On the node:
+#
+#   /opt/zk2/bin            zk2 commands, replaced as a whole on every deploy
+#   /opt/zk2/VERSION        git describe of the zk2 checkout that was deployed
+#   /usr/local/sbin/zk2-*   symlinks to /opt/zk2/bin, so the commands are in PATH
+#   /etc/zk2/node.conf      from nodes/<NODE>/node.conf
+#   /etc/zk2/publication/   from nodes/<NODE>/publication/, mirrored
+#   /etc/zk2/zk2-env        secrets: NEVER written by this script, create it
+#                           on the node by hand, mode 600
+#
+# The node is reached by SSH_HOST from its node.conf, or by its name when
+# SSH_HOST is not set. Log in as root; rsync must be installed on the node.
+#
+# Container roles: nodes/<NODE>/deploy/<ROLE>.conf says which instance gets
+# which files; see examples/node/deploy/. Files are taken from
+# containers/<ROLE>/ in zk2 (shared) and nodes/<NODE>/<ROLE>/ in the site
+# (local), staged on the node with rsync and pushed with "incus file push".
+# That route goes past the instance network: no sshd and no root key are
+# needed inside the container.
+#
+#   --dry-run   show what would change, change nothing
+
+set -euo pipefail
+
+ZK2_HOME=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+# Remote locations. Overridable for tests and unusual layouts; the rest of
+# zk2 expects the defaults.
+R_OPT=${ZK2_R_OPT:-/opt/zk2}
+R_ETC=${ZK2_R_ETC:-/etc/zk2}
+R_SBIN=${ZK2_R_SBIN:-/usr/local/sbin}
+R_STAGE=${ZK2_R_STAGE:-/var/lib/zk2/deploy-staging}
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+DRY_RUN=0
+LIST=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --list)    LIST=1; shift ;;
+        -h|--help) sed -n '3,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+
+find_site() {
+    local d
+    if [ -n "${ZK2_SITE:-}" ]; then
+        [ -r "${ZK2_SITE}/zk2-site.conf" ] || die "ZK2_SITE=${ZK2_SITE}: no zk2-site.conf there"
+        (cd "$ZK2_SITE" && pwd)
+        return
+    fi
+    d=$(pwd)
+    while [ "$d" != / ]; do
+        [ -r "${d}/zk2-site.conf" ] && { echo "$d"; return; }
+        d=$(dirname "$d")
+    done
+    die "no zk2-site.conf in $(pwd) or above. Run from your site, set ZK2_SITE, or create a site: zk2-site init DIR"
+}
+
+SITE=$(find_site)
+
+list_nodes() {
+    find "${SITE}/nodes" -mindepth 2 -maxdepth 2 -name node.conf -printf '%h\n' 2>/dev/null \
+        | xargs -r -n1 basename | sort
+}
+
+if [ "$LIST" = 1 ]; then
+    list_nodes
+    exit 0
+fi
+
+[ $# -ge 1 ] || die "usage: zk2-deploy [--dry-run] NODE [ROLE]   (zk2-deploy --list shows nodes)"
+NODE_NAME=$1
+ROLE=${2:-}
+
+NODE_DIR="${SITE}/nodes/${NODE_NAME}"
+[ -r "${NODE_DIR}/node.conf" ] || {
+    say "no ${NODE_DIR}/node.conf. Nodes of this site:"
+    list_nodes | sed 's/^/  /' >&2
+    exit 1
+}
+
+SSH_HOST=""
+# shellcheck source=/dev/null
+. "${NODE_DIR}/node.conf"
+NODE=${SSH_HOST:-$NODE_NAME}
+
+command -v rsync >/dev/null || die "rsync is required on the workstation"
+
+# One ssh connection for the whole run: without it every step is a separate
+# login, and with a password or a hardware key that is a prompt per step.
+# The socket lives in a private directory, not under a predictable /tmp name.
+MUX_DIR=$(mktemp -d "${TMPDIR:-/tmp}/zk2-deploy.XXXXXX")
+trap 'ssh -o ControlPath="${MUX_DIR}/s" -O exit "$NODE" 2>/dev/null; rm -rf "$MUX_DIR"' EXIT
+SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=${MUX_DIR}/s" -o ControlPersist=60s)
+
+# Commands are built here and expanded on this side on purpose; values that
+# reach the remote shell go through q().
+# shellcheck disable=SC2029
+rssh() { ssh "${SSH_OPTS[@]}" "$NODE" "$@"; }
+
+# mkdir on the node, skipped in a dry run: rsync reports what it would create.
+rmkdir() { [ "$DRY_RUN" = 1 ] || rssh "mkdir -p $(q "$1")"; }
+
+RSYNC=(rsync -a --itemize-changes -e "ssh ${SSH_OPTS[*]}")
+[ "$DRY_RUN" = 1 ] && RSYNC+=(--dry-run)
+
+# Quote one value for the remote shell.
+q() { printf '%q' "$1"; }
+
+rssh 'command -v rsync >/dev/null' \
+    || die "rsync is not installed on ${NODE} (apt install rsync)"
+
+# --------------------------------------------------------------------------
+# Code and node data
+# --------------------------------------------------------------------------
+
+deploy_node() {
+    local version
+    version=$(git -C "$ZK2_HOME" describe --tags --always --dirty 2>/dev/null || echo unknown)
+
+    say "node:    ${NODE_NAME} (${NODE})"
+    say "zk2:     ${ZK2_HOME} (${version})"
+    say "site:    ${SITE}"
+    [ "$DRY_RUN" = 1 ] && say "(dry run: nothing is changed)"
+
+    say
+    say "== code -> ${R_OPT}/bin"
+    rmkdir "${R_OPT}/bin"
+    # Mirrored with --delete: the directory belongs to zk2 alone, and a command
+    # removed from zk2 must not keep running on the node from an old deploy.
+    "${RSYNC[@]}" --delete --chmod=D755,F755 \
+        "${ZK2_HOME}/bin/" "${NODE}:${R_OPT}/bin/"
+
+    say
+    say "== data -> ${R_ETC}"
+    rmkdir "$R_ETC"
+    "${RSYNC[@]}" --chmod=F644 "${NODE_DIR}/node.conf" "${NODE}:${R_ETC}/node.conf"
+    # Mirrored too: zk2-publish takes the list of ACLs from the files here,
+    # and a file removed from git but left on the node keeps demanding an ACL
+    # that no longer exists.
+    if [ -d "${NODE_DIR}/publication" ]; then
+        "${RSYNC[@]}" --delete --chmod=D755,F644 \
+            "${NODE_DIR}/publication/" "${NODE}:${R_ETC}/publication/"
+    fi
+
+    [ "$DRY_RUN" = 1 ] && { say; say "(links, VERSION and checks skipped)"; return 0; }
+
+    say
+    say "== links in ${R_SBIN}"
+    # Every zk2 command except the library gets a link. Links into
+    # ${R_OPT}/bin whose target is gone are removed; nothing else in
+    # ${R_SBIN} is touched.
+    # shellcheck disable=SC2016
+    rssh "set -e
+        opt=$(q "${R_OPT}/bin"); sbin=$(q "$R_SBIN")
+        mkdir -p \"\$sbin\"
+        for f in \"\$opt\"/zk2-*; do
+            n=\${f##*/}
+            [ \"\$n\" = zk2-lib ] && continue
+            ln -sfn \"\$f\" \"\$sbin/\$n\"
+        done
+        for l in \"\$sbin\"/zk2-*; do
+            [ -L \"\$l\" ] || continue
+            case \$(readlink \"\$l\") in \"\$opt\"/*) ;; *) continue ;; esac
+            [ -e \"\$l\" ] || { rm -f \"\$l\"; echo \"removed stale link \$l\"; }
+        done
+        ls \"\$sbin\"/zk2-* | sed 's/^/  /'"
+
+    rssh "printf '%s\n' $(q "$version") > $(q "${R_OPT}/VERSION")"
+
+    say
+    say "== on the node"
+    # shellcheck disable=SC2016
+    rssh "cat $(q "${R_OPT}/VERSION") | sed 's/^/  version: /'
+        if [ -e $(q "${R_ETC}/zk2-env") ]; then
+            m=\$(stat -c %a $(q "${R_ETC}/zk2-env"))
+            [ \"\$m\" = 600 ] && echo '  zk2-env: present' || echo \"  zk2-env: present, mode \$m - should be 600\"
+        else
+            echo '  zk2-env: missing - tools that need secrets will refuse to run'
+        fi"
+}
+
+# --------------------------------------------------------------------------
+# Container role
+# --------------------------------------------------------------------------
+
+# A role's files come from TWO places on purpose:
+#
+#   zk2/containers/<role>/        shared by all nodes: nginx.conf, snippets
+#   site nodes/<node>/<role>/     local: the vhosts of this node
+#
+# Keeping per-node files in a shared directory fails in the worst way: nginx
+# -t does not care whether an upstream exists, so a vhost of another node
+# deploys fine and breaks on the first request.
+#
+# Top-level names must be unique across the two places: they are pushed into
+# the container by name, and two "conf.d" would overwrite each other.
+DEPLOY_PATHS=()
+DEPLOY_NAMES=()
+
+collect() {
+    local dir=$1 list=$2 f base n
+    # list is space separated; word splitting is wanted here.
+    # shellcheck disable=SC2086
+    for f in $list; do
+        [ -e "${dir}/${f}" ] || die "no ${dir}/${f}"
+        base=${f##*/}
+        for n in ${DEPLOY_NAMES[@]+"${DEPLOY_NAMES[@]}"}; do
+            [ "$n" = "$base" ] && die "${base} is listed both in FILES and NODE_FILES"
+        done
+        DEPLOY_PATHS+=("${dir}/${f}")
+        DEPLOY_NAMES+=("$base")
+    done
+}
+
+deploy_role() {
+    local role=$1 conf="${NODE_DIR}/deploy/${1}.conf"
+    if [ ! -r "$conf" ]; then
+        say "no ${conf}. Roles of ${NODE_NAME}:"
+        find "${NODE_DIR}/deploy" -maxdepth 1 -name '*.conf' -printf '  %f\n' 2>/dev/null \
+            | sed 's/\.conf$//' | sort >&2
+        exit 1
+    fi
+
+    # The contract of a role file, declared up front: it documents the format
+    # and keeps an unset variable from being picked up from the environment.
+    #   NAME        instance that receives the files
+    #   DEST        directory inside the instance
+    #   FILES       from zk2/containers/<role>/ (optional)
+    #   NODE_FILES  from site nodes/<node>/<role>/ (optional)
+    #   CHECK       command run in the instance after the push (optional)
+    #   RELOAD      command run after CHECK succeeds (optional)
+    #   ROLE        directory name if it differs from the file name (optional)
+    local NAME="" DEST="" FILES="" NODE_FILES="" CHECK="" RELOAD="" ROLE=""
+    # shellcheck source=/dev/null
+    . "$conf"
+    local dir=${ROLE:-$role}
+    [ -n "$NAME" ] || die "${conf}: NAME is not set"
+    [ -n "$DEST" ] || die "${conf}: DEST is not set"
+    [ -n "$FILES$NODE_FILES" ] || die "${conf}: neither FILES nor NODE_FILES is set"
+
+    DEPLOY_PATHS=(); DEPLOY_NAMES=()
+    [ -z "$FILES" ]      || collect "${ZK2_HOME}/containers/${dir}" "$FILES"
+    [ -z "$NODE_FILES" ] || collect "${NODE_DIR}/${dir}" "$NODE_FILES"
+
+    local stage="${R_STAGE}/${role}"
+    say "role:    ${role} -> instance ${NAME} on ${NODE_NAME}, ${DEST}"
+    say "files:   ${DEPLOY_NAMES[*]}"
+    [ "$DRY_RUN" = 1 ] && say "(dry run: nothing is changed)"
+    say
+
+    rmkdir "$stage"
+    # --delete on the staging directory: a file removed from git must stop
+    # travelling to the instance. Inside the instance nothing is deleted -
+    # "incus file push" only adds, and deleting there by a computed list is
+    # not something to do silently. Remove leftovers by hand.
+    "${RSYNC[@]}" --delete "${DEPLOY_PATHS[@]}" "${NODE}:${stage}/"
+
+    [ "$DRY_RUN" = 1 ] && { say; say "(push and checks skipped)"; return 0; }
+
+    # One push per top-level name. --uid 0 --gid 0: config inside belongs to
+    # root, not to whatever uid the file had on the workstation - a user with
+    # that uid inside the instance would otherwise own /etc/nginx. ${DEST%/}
+    # avoids "name//" for DEST=/.
+    local f
+    for f in "${DEPLOY_NAMES[@]}"; do
+        rssh "incus --quiet file push -r -p --uid 0 --gid 0 $(q "${stage}/${f}") $(q "${NAME}${DEST%/}/")"
+    done
+
+    if [ -n "$CHECK" ]; then
+        say "check:   ${CHECK}"
+        rssh "incus exec $(q "$NAME") -- sh -c $(q "$CHECK") </dev/null"
+    fi
+    if [ -n "$RELOAD" ]; then
+        say "reload:  ${RELOAD}"
+        rssh "incus exec $(q "$NAME") -- sh -c $(q "$RELOAD") </dev/null"
+    fi
+}
+
+# --------------------------------------------------------------------------
+
+if [ -n "$ROLE" ]; then
+    deploy_role "$ROLE"
+else
+    deploy_node
+fi
