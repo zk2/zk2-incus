@@ -112,6 +112,14 @@ above (or `ZK2_SITE`).
 | `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your site |
 | `/etc/zk2/zk2-env` | secrets: borg passphrase, mail credentials | **you**, by hand, mode 600; never in git, never overwritten |
 
+Nightly report on the node, mailed only when there is something to say
+(`ZK2_EMAIL` in `zk2-env`, any of sendmail, msmtp or ssmtp to send it):
+
+```
+# /etc/cron.d/zk2
+30 5 * * * root /usr/local/sbin/zk2-health --mail
+```
+
 Log in as root over ssh; the node needs `rsync`. The ssh alias is the node
 directory name unless `SSH_HOST` in `node.conf` says otherwise.
 
@@ -121,6 +129,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
 | `zk2-site` | workstation | create a site, add a node from the example |
+| `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
 

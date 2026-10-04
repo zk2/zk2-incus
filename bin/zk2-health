@@ -1,0 +1,356 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Node health: differences between how the node is meant to be and how it is.
+#
+# Usage: zk2-health [--mail]
+#   (no option)  report to stdout; exit code 1 when there are findings
+#   --mail       mail the report when there are findings, stay silent otherwise
+#
+# Run it nightly from cron with --mail. Every check here exists because its
+# problem stays invisible until it hurts: a kernel that will boot without
+# ZFS, a disk that failed while the pool still said ONLINE, an instance
+# without a memory limit, a port opened by hand.
+#
+# Checks for other parts of zk2 (backup inventory, leftover snapshots,
+# backup storage space, VPN routes, monitoring) join this file together with
+# those parts.
+#
+# Settings, all optional, in node.conf:
+#   ZFS_POOL       pool that must exist (all pools are checked regardless)
+#   POOL_PCT       pool usage threshold, % (85)
+#   MEM_PCT        instance memory usage threshold, % of its limit (90)
+#   NGINX_CT       front instance with Let's Encrypt certificates (nginx)
+#   CERT_DAYS      warn when a front certificate expires sooner (14)
+#   VPN_CT         OpenVPN instance (openvpn)
+#   VPN_CERT_DAYS  warn when an OpenVPN certificate expires sooner (30)
+#   CRL_DAYS       warn when the OpenVPN revocation list expires sooner (14)
+#   NESTED_OOM_OK  instances where OOM kills inside nested cgroups are normal
+#   NODE_NAME      name used in the mail subject (hostname)
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_cmd incus jq
+
+MAIL=0
+case "${1:-}" in
+    --mail) MAIL=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+zk2_load_node
+zk2_try_env
+
+ZFS_POOL=${ZFS_POOL:-}
+POOL_PCT=${POOL_PCT:-85}
+MEM_PCT=${MEM_PCT:-90}
+NGINX_CT=${NGINX_CT:-nginx}
+CERT_DAYS=${CERT_DAYS:-14}
+VPN_CT=${VPN_CT:-openvpn}
+VPN_CERT_DAYS=${VPN_CERT_DAYS:-30}
+CRL_DAYS=${CRL_DAYS:-14}
+NODE_NAME=${NODE_NAME:-$(hostname -s)}
+
+STATE_DIR=${ZK2_STATE_DIR:-/var/lib/zk2}
+STATE="${STATE_DIR}/health.state"
+PUBLISH="$(dirname "$(readlink -f "$0")")/zk2-publish"
+
+findings=""
+add() { findings+="$1"$'\n'; }
+
+instances=$(incus query "/1.0/instances?recursion=1" </dev/null)
+
+# --------------------------------------------------------------------------
+# Instances that should start on their own but are down
+# --------------------------------------------------------------------------
+
+while IFS=$'\t' read -r name status; do
+    add "instance ${name}: boot.autostart=true, but it is ${status}"
+done < <(jq -r '.[] | select((.expanded_config["boot.autostart"] // "false") == "true"
+                             and .status != "Running") | [.name, .status] | @tsv' <<<"$instances")
+
+# --------------------------------------------------------------------------
+# Kernel and the ZFS module
+#
+# The kernel arrives with a plain apt upgrade; the ZFS module is built for
+# each kernel separately by dkms. If that build failed, it has to be known
+# BEFORE the reboot: after it the pool is not there and no instance starts.
+#
+# The kernel that boots next without the module is an emergency. An older
+# kernel without it is kept as a fallback, and the fallback would come up
+# without ZFS.
+# --------------------------------------------------------------------------
+
+running=$(uname -r)
+next=$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -V | tail -1)
+
+[ -n "$next" ] && [ "$running" != "$next" ] \
+    && add "kernel: running ${running}, newer ${next} installed - reboot pending"
+
+while IFS= read -r k; do
+    if [ -f "/lib/modules/${k}/updates/dkms/zfs.ko" ] \
+    || [ -f "/lib/modules/${k}/updates/dkms/zfs.ko.xz" ] \
+    || modinfo -k "$k" zfs >/dev/null 2>&1; then
+        continue
+    fi
+    if [ "$k" = "$next" ]; then
+        add "KERNEL ${k} HAS NO ZFS MODULE and boots next - instances will not start"
+    else
+        add "kernel ${k}: no ZFS module (older fallback kernel): apt-get install -y linux-headers-${k} && dkms autoinstall -k ${k}"
+    fi
+done < <(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -V)
+
+# The check above sees the failure once it happened; this one sees its cause
+# in advance. Without the headers metapackage apt upgrade brings a new kernel
+# WITHOUT headers, dkms quietly builds the module for the old kernels only,
+# and the node is one reboot away from coming up without its pool.
+if command -v dpkg-query >/dev/null 2>&1; then
+    case "$(dpkg-query -W -f='${Status}' linux-headers-amd64 2>/dev/null || true)" in
+        *"install ok installed"*) ;;
+        *) add "kernel headers: linux-headers-amd64 is not installed - the next kernel arrives without headers and dkms cannot build ZFS for it: apt-get install -y linux-headers-amd64" ;;
+    esac
+fi
+
+# --------------------------------------------------------------------------
+# ZFS pools
+#
+# Not the "state:" line: a pool can report ONLINE while one of its disks is
+# FAULTED with hundreds of write errors. Device states and the status line
+# are what count. Only the config: block is read for devices; continuation
+# lines of scan: and status: would otherwise pass for devices during a scrub
+# or resilver.
+#
+# All pools, not only ZFS_POOL: a second single-disk pool fails just as
+# quietly, and a report about one pool would say "no findings".
+# --------------------------------------------------------------------------
+
+check_pool() {
+    local p=$1 st cap dev state
+    st=$(zpool status "$p" 2>/dev/null)
+
+    while read -r dev state _; do
+        case "$dev" in ''|NAME|mirror-*|raidz*|draid*|"$p") continue ;; esac
+        case "$state" in ONLINE|'') continue ;; esac
+        add "POOL ${p}: device ${dev} is ${state}"
+    done < <(printf '%s\n' "$st" | awk '/^config:/ { c = 1; next } /^errors:/ { c = 0 } c')
+
+    case "$st" in
+        *"status:"*) add "pool ${p}: $(printf '%s' "$st" | awk '/status:/ { $1 = ""; print; exit }' | sed 's/^ *//')" ;;
+    esac
+    case "$st" in
+        *"errors: No known data errors"*) ;;
+        *) add "pool ${p}: data errors, see zpool status ${p}" ;;
+    esac
+
+    cap=$(zpool list -H -o capacity "$p" 2>/dev/null | tr -d '%')
+    [ -n "$cap" ] && [ "$cap" -ge "$POOL_PCT" ] \
+        && add "pool ${p} is ${cap}% full (threshold ${POOL_PCT}%)"
+    return 0
+}
+
+if command -v zpool >/dev/null 2>&1; then
+    [ -z "$ZFS_POOL" ] || zpool list "$ZFS_POOL" >/dev/null 2>&1 || add "pool ${ZFS_POOL} not found"
+    while IFS= read -r p; do
+        check_pool "$p"
+    done < <(zpool list -H -o name 2>/dev/null)
+else
+    add "zpool not found - pools not checked"
+fi
+
+# --------------------------------------------------------------------------
+# Memory limits hit
+#
+# memory.events.local of the container's cgroup: "max" counts how often the
+# container hit its own limits.memory, "oom_kill" how many processes the
+# kernel killed for it. The plain memory.events would also count nested
+# cgroups - docker containers inside with their own --memory - and a browser
+# hitting its 1.5G docker limit is not the instance hitting its own.
+#
+# Kills inside nested cgroups are reported on a separate line: with a compose
+# service under mem_limit that may be a killed database. Where such kills are
+# routine, list the instance in NESTED_OOM_OK.
+#
+# The counters grow from the container start and never reset, so only the
+# GROWTH since the previous run is reported. The same line every night for
+# months teaches you to skip the whole mail.
+# --------------------------------------------------------------------------
+
+prev_state=""
+[ -r "$STATE" ] && prev_state=$(cat "$STATE")
+new_state=""
+
+while IFS=$'\t' read -r name lim; do
+    cg="/sys/fs/cgroup/lxc.payload.${name}"
+    if [ -r "${cg}/memory.events.local" ]; then
+        hits=$(awk '$1 == "max" { print $2 }' "${cg}/memory.events.local")
+        oom=$(awk '$1 == "oom_kill" { print $2 }' "${cg}/memory.events.local")
+        all_oom=$(awk '$1 == "oom_kill" { print $2 }' "${cg}/memory.events")
+        nested=$(( ${all_oom:-0} - ${oom:-0} ))
+        new_state+="${name} ${hits:-0} ${oom:-0} ${nested}"$'\n'
+
+        # No line yet for a new instance: read fails, and under set -e that
+        # would end the whole report.
+        read -r was was_oom was_nested < <(awk -v n="$name" '$1 == n { print $2, $3, $4 }' <<<"$prev_state") || true
+        [ "${hits:-0}" -gt "${was:-0}" ] \
+            && add "instance ${name}: hit its memory limit $(( hits - ${was:-0} )) more times (${hits} in total)"
+        [ "${oom:-0}" -gt "${was_oom:-0}" ] \
+            && add "INSTANCE ${name}: processes killed for lack of memory, $(( oom - ${was_oom:-0} )) more (${oom} in total)"
+        case " ${NESTED_OOM_OK:-} " in
+            *" ${name} "*) ;;
+            *) [ "$nested" -gt "${was_nested:-0}" ] \
+                   && add "instance ${name}: processes killed by nested cgroup limits (docker --memory, mem_limit), $(( nested - ${was_nested:-0} )) more (${nested} in total); not its own limit - journalctl -k | grep oom-kill shows which" ;;
+        esac
+    fi
+
+    # Usage right now against the limit. Incus writes limits as "16GiB";
+    # numfmt --from=iec rejects "16Gi" ("invalid suffix"), and with the error
+    # thrown away the limit became 0 and this check never fired. --from=auto
+    # takes both "16Gi" (2^30) and "16G" (10^9), the way Incus means them.
+    [ "$lim" = "-" ] && continue
+    used=$(incus query "/1.0/instances/${name}/state" </dev/null 2>/dev/null | jq -r '.memory.usage // 0')
+    tot=$(numfmt --from=auto "${lim%B}" 2>/dev/null || echo 0)
+    if [ "${tot:-0}" -le 0 ]; then
+        # A percentage limit is valid in Incus but not parsed here; a check
+        # skipped silently is indistinguishable from a check passed.
+        add "instance ${name}: memory limit '${lim}' not understood, usage not checked"
+    elif [ "${used:-0}" -gt 0 ]; then
+        pct=$(( used * 100 / tot ))
+        [ "$pct" -ge "$MEM_PCT" ] && add "instance ${name}: using ${pct}% of its memory limit (${lim})"
+    fi
+done < <(jq -r '.[] | select(.status == "Running")
+                | [.name, (.expanded_config["limits.memory"] // "-")] | @tsv' <<<"$instances")
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+printf '%s' "$new_state" > "$STATE" 2>/dev/null \
+    || add "state file ${STATE} not writable - memory counters will be reported again"
+
+# --------------------------------------------------------------------------
+# Instances without limits
+#
+# The memory check above starts with "if there is a limit" and passes an
+# instance without one in silence. Without a memory limit a leaking instance
+# eats the memory of the NODE and the OOM killer picks its victim among
+# everyone; without a root disk size it fills the pool, and a full ZFS pool
+# stops writes for all. Limits live in the Incus database, not inside the
+# instance, so an instance restored from an archive comes back without them.
+#
+# Expanded config: a limit from a profile is a limit as well.
+# --------------------------------------------------------------------------
+
+while IFS=$'\t' read -r name mem disk; do
+    [ "$mem" = "-" ]  && add "instance ${name}: no memory limit - it can take the memory of the whole node"
+    [ "$disk" = "-" ] && add "instance ${name}: no root disk size - it can fill the pool"
+done < <(jq -r '.[] | [ .name, (.expanded_config["limits.memory"] // "-"),
+                        (.expanded_devices.root.size // "-") ] | @tsv' <<<"$instances")
+
+# The same size seen by ZFS. Incus config says a size is set, not which
+# property carries it: quota counts snapshots together with data, so a
+# container near its size runs into it in the middle of a backup; refquota
+# counts live data only. The volume key zfs.use_refquota decides, and the
+# pool key volume.zfs.use_refquota gives it a default. Fix per volume, Incus
+# swaps the properties itself:
+#   incus storage volume set POOL container/NAME zfs.use_refquota=true
+while IFS=$'\t' read -r ds quota; do
+    [ "$quota" = none ] || add "instance ${ds##*/}: root size is a ZFS quota, not refquota - backup snapshots eat into it"
+done < <(zfs list -H -o name,quota 2>/dev/null | awk -F'\t' '$1 ~ /\/containers\/[^\/]+$/')
+
+# --------------------------------------------------------------------------
+# Front certificates
+# --------------------------------------------------------------------------
+
+if zk2_ct_running "$NGINX_CT"; then
+    while IFS='|' read -r name days; do
+        [ -n "$name" ] && add "certificate ${name}: ${days} days left"
+    done < <(
+        # Single quotes on purpose: this runs INSIDE the instance.
+        # shellcheck disable=SC2016
+        incus exec "$NGINX_CT" -- sh -c '
+            for c in /etc/letsencrypt/live/*/fullchain.pem; do
+                [ -e "$c" ] || continue
+                end=$(openssl x509 -enddate -noout -in "$c" | cut -d= -f2)
+                days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+                [ "$days" -lt '"$CERT_DAYS"' ] && echo "$(basename "$(dirname "$c")")|$days"
+            done' </dev/null 2>/dev/null || true
+    )
+fi
+
+# --------------------------------------------------------------------------
+# OpenVPN certificates and revocation list
+#
+# The revocation list matters most: once it expires, OpenVPN refuses ALL
+# clients, not only the revoked ones. And it is read by the server after it
+# dropped privileges to nobody: a crl.pem nobody cannot read means revocation
+# silently does not work.
+# --------------------------------------------------------------------------
+
+if zk2_ct_running "$VPN_CT"; then
+    while IFS='|' read -r what days; do
+        case "$days" in ''|*[!0-9-]*) continue ;; esac
+        if [ "$days" -lt 0 ]; then
+            add "VPN: ${what} EXPIRED $(( -days )) days ago"
+        else
+            add "VPN: ${what} expires in ${days} days"
+        fi
+    done < <(
+        # shellcheck disable=SC2016
+        incus exec "$VPN_CT" -- sh -c '
+            days_left() {
+                end=$(openssl "$1" -enddate -noout -in "$2" 2>/dev/null | cut -d= -f2)
+                [ -n "$end" ] || return
+                echo $(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            }
+            for c in /etc/openvpn/server/*.crt; do
+                [ -e "$c" ] || continue
+                d=$(days_left x509 "$c")
+                [ -n "$d" ] && [ "$d" -lt '"$VPN_CERT_DAYS"' ] && echo "certificate $(basename "$c")|$d"
+            done
+            if [ -e /etc/openvpn/crl.pem ]; then
+                d=$(days_left crl /etc/openvpn/crl.pem)
+                [ -n "$d" ] && [ "$d" -lt '"$CRL_DAYS"' ] && echo "REVOCATION LIST|$d"
+            else
+                echo "revocation list missing|0"
+            fi' </dev/null 2>/dev/null || true
+    )
+    incus exec "$VPN_CT" -- sh -c '[ ! -e /etc/openvpn/crl.pem ] || su -s /bin/sh -c "test -r /etc/openvpn/crl.pem" nobody' \
+        </dev/null >/dev/null 2>&1 \
+        || add "VPN: crl.pem is not readable by nobody - client revocation DOES NOT WORK"
+fi
+
+# --------------------------------------------------------------------------
+# Publication versus git
+#
+# Configuration in git dies not of an awkward format but of the day someone
+# changes the node by hand and the file starts to lie quietly.
+# --------------------------------------------------------------------------
+
+if [ -x "$PUBLISH" ]; then
+    if ! pub=$("$PUBLISH" diff 2>&1); then
+        add "publication differs from git (zk2-publish diff):"
+        # shellcheck disable=SC2001
+        while IFS= read -r l; do
+            add "    ${l#  }"
+        done < <(sed -e 's/\x1b\[[0-9;]*m//g' <<<"$pub" \
+                 | grep -E '^  [^ ]' | grep -vE ': matches$|egress allowed$')
+    fi
+else
+    add "publication not checked: no ${PUBLISH}"
+fi
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+if [ -z "$findings" ]; then
+    [ "$MAIL" = 1 ] || echo "No findings."
+    exit 0
+fi
+
+report=$(printf '%s\nzk2 %s on %s\n' "$findings" "$(zk2_version)" "$NODE_NAME")
+if [ "$MAIL" = 1 ]; then
+    zk2_mail "${NODE_NAME}: health findings" <<<"$report" || printf '%s\n' "$report"
+else
+    printf '%s\n' "$report"
+fi
+exit 1

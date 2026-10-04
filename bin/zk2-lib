@@ -30,3 +30,88 @@ zk2_require_cmd() {
     done
     [ -z "$missing" ] || zk2_die "missing commands:${missing}"
 }
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+ZK2_CONF_DIR=${ZK2_CONF_DIR:-/etc/zk2}
+ZK2_NODE_CONF=${ZK2_NODE_CONF:-${ZK2_CONF_DIR}/node.conf}
+ZK2_ENV=${ZK2_ENV:-${ZK2_CONF_DIR}/zk2-env}
+
+# node.conf: required by most tools, so a missing file is fatal.
+zk2_load_node() {
+    [ -r "$ZK2_NODE_CONF" ] || zk2_die "no ${ZK2_NODE_CONF} (deploy the node with zk2-deploy)"
+    # shellcheck source=/dev/null
+    . "$ZK2_NODE_CONF"
+}
+
+# zk2-env: secrets. zk2_load_env VAR... requires the file and the variables;
+# zk2_try_env loads it when it is there and says nothing otherwise, for
+# tools that have plenty to do without secrets and report what they skipped.
+zk2_load_env() {
+    local v
+    [ -r "$ZK2_ENV" ] || zk2_die "no ${ZK2_ENV}"
+    # shellcheck source=/dev/null
+    . "$ZK2_ENV"
+    for v in "$@"; do
+        [ -n "${!v:-}" ] || zk2_die "${v} is not set in ${ZK2_ENV}"
+    done
+}
+
+zk2_try_env() {
+    # shellcheck source=/dev/null
+    [ -r "$ZK2_ENV" ] && . "$ZK2_ENV"
+    return 0
+}
+
+zk2_version() { cat "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../VERSION" 2>/dev/null || echo unknown; }
+
+# --------------------------------------------------------------------------
+# Mail
+# --------------------------------------------------------------------------
+
+# What sends mail is looked up, not hardcoded: Debian 13 has no ssmtp any
+# more, msmtp took its place, and a hardcoded path silently turned the nightly
+# mail into a line in a log nobody reads. All of these accept -t.
+zk2_mta() {
+    local c
+    for c in /usr/sbin/sendmail /usr/bin/msmtp /usr/sbin/ssmtp; do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+# zk2_mail SUBJECT - plain text body on stdin, to ZK2_EMAIL (zk2-env) or root.
+#
+# Returns non-zero when the mail did not go out or there is nothing to send
+# it with. The caller must then print the report itself: a report that went
+# nowhere looks exactly like "nothing to report".
+zk2_mail() {
+    local mta subject=$1
+    if ! mta=$(zk2_mta); then
+        zk2_warn "mail not sent: no sendmail, msmtp or ssmtp"
+        return 1
+    fi
+    {
+        printf 'To: %s\n' "${ZK2_EMAIL:-root}"
+        printf 'Subject: %s\n' "$subject"
+        printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n\n'
+        cat
+    } | "$mta" -t || { zk2_warn "sending through ${mta} failed"; return 1; }
+}
+
+# --------------------------------------------------------------------------
+# Incus
+# --------------------------------------------------------------------------
+#
+# Every "incus exec" takes stdin. Inside a loop that reads a file or a
+# process substitution it eats the rest of the input, the loop ends quietly
+# and the script reports success having done part of the work. Hence
+# </dev/null on every incus exec, here and in the callers.
+
+zk2_ct_names()   { incus list --format csv -c n </dev/null 2>/dev/null; }
+zk2_ct_exists()  { incus info "$1" </dev/null >/dev/null 2>&1; }
+# Status from "incus info", not "incus list": list takes a name PREFIX, so
+# "incus list web" also returns web-db, and three lines are not one state.
+zk2_ct_running() { [ "$(incus info "$1" </dev/null 2>/dev/null | awk '/^Status:/ { print $2; exit }')" = RUNNING ]; }
