@@ -1,0 +1,318 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# New instance: a short dialog, creation, first boot setup.
+#
+#   zk2-new-ct             ask and create
+#   zk2-new-ct --dry-run   ask and print the commands, create nothing
+#
+# A dialog rather than options: nobody creates instances from scripts here,
+# and remembering the order of seven options once a quarter does not work.
+#
+# Everything that must take effect is set BEFORE the first start: cloud-init
+# runs once, and an instance that booted with a DHCP address and the wrong
+# hostname gets no second chance to configure itself.
+#
+# SWAP. With a hard memory limit, limits.memory.swap is a SIZE: how much of
+# the node's swap the instance may use on top of limits.memory. true and
+# false both mean no swap (memory.swap.max=0); the difference between them
+# is swappiness, which cgroup v2 does not have.
+#
+# IMAGE. A /cloud image is required: without cloud-init inside, the profile
+# base configures nothing - no packages, no user, no shell - and the instance
+# is still created successfully. So we ask instead of guessing.
+#
+# DOCKER. Asked, because there is nothing to detect yet: the image is clean.
+# "Yes" means security.nesting=true before the first start and docker-ce
+# with compose after cloud-init. Without nesting dockerd starts, but none of
+# its containers with their own network does: "runc create failed: open
+# sysctl net.ipv4.ip_unprivileged_port_start: permission denied" - and
+# nothing in dmesg, since the AppArmor rule is a silent deny. Nesting for
+# everyone would weaken isolation for nothing.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus jq
+
+DRY_RUN=0
+case "${1:-}" in
+    --dry-run) DRY_RUN=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+zk2_load_node
+zk2_net_defaults
+[ -n "${CT_NET:-}" ] || zk2_die "CT_NET is not set in ${ZK2_NODE_CONF}"
+CT_USER=${CT_USER:-admin}
+
+run() { if [ "$DRY_RUN" = 1 ]; then printf '  %s\n' "$*" >&2; else "$@"; fi; }
+
+# The profile base is not decoration: without it there is a bare image with
+# no packages, no user and no shell.
+incus profile show base </dev/null >/dev/null 2>&1 || zk2_die "no profile base - build it: zk2-base-profile"
+
+# --------------------------------------------------------------------------
+# Dialog (from /dev/tty, so the script survives being run from a pipe)
+# --------------------------------------------------------------------------
+
+ask() {
+    local __var=$1 prompt=$2 def=${3:-} ans
+    read -r -p "${prompt}${def:+ [${def}]}: " ans </dev/tty
+    printf -v "$__var" '%s' "${ans:-$def}"
+}
+yesno() {
+    local ans
+    read -r -p "$1 [$([ "${2:-n}" = y ] && echo Y/n || echo y/N)]: " ans </dev/tty
+    ans=${ans:-${2:-n}}
+    [[ "${ans,,}" =~ ^(y|yes)$ ]]
+}
+
+# The name is the identifier and, unless told otherwise, the hostname. DNS
+# rules, not all digits: Incus refuses the rest itself, but only after all
+# the questions.
+NAME=""
+while [ -z "$NAME" ]; do
+    ask NAME "Instance name"
+    if ! [[ "$NAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || [[ "$NAME" =~ ^[0-9]+$ ]]; then
+        zk2_err "letters, digits and dashes, not all digits, no dash at the end, up to 63 characters"
+        NAME=""
+    elif zk2_ct_exists "$NAME"; then
+        zk2_err "${NAME} already exists"
+        NAME=""
+    fi
+done
+
+cat >&2 <<'EOF'
+
+Image:
+  1) images:debian/13/cloud
+  2) images:ubuntu/24.04/cloud
+  3) images:almalinux/9/cloud
+  4) other
+EOF
+IMAGE=""
+while [ -z "$IMAGE" ]; do
+    ask CHOICE "Choice" 1
+    case "$CHOICE" in
+        1) IMAGE=images:debian/13/cloud ;;
+        2) IMAGE=images:ubuntu/24.04/cloud ;;
+        3) IMAGE=images:almalinux/9/cloud ;;
+        4) ask IMAGE "Image (for example images:rockylinux/9/cloud)" ;;
+        *) zk2_err "1, 2, 3 or 4"; continue ;;
+    esac
+    [ -n "$IMAGE" ] || continue
+    case "$IMAGE" in
+        */cloud) ;;
+        *) zk2_warn "${IMAGE} is not a /cloud image: no cloud-init inside, the profile base will do nothing"
+           yesno "Take it anyway?" n || { IMAGE=""; continue; } ;;
+    esac
+    # Asked now, not at creation: a typo would otherwise surface after all
+    # the other questions.
+    if ! incus image info "$IMAGE" </dev/null >/dev/null 2>&1; then
+        zk2_warn "image ${IMAGE} not found (or the image server is unreachable)"
+        yesno "Continue with it?" n || IMAGE=""
+    fi
+done
+
+ask HOSTNAME_CT "Hostname inside" "$NAME"
+ask DISK "Root disk size" 20GiB
+ask RAM  "Memory limit"   4GiB
+
+SWAP=""
+while [ -z "$SWAP" ]; do
+    ask SWAP "Swap on top of memory (512MiB, 2GiB, or 0 for none)" 0
+    [[ "$SWAP" =~ ^(0|[1-9][0-9]*(MiB|GiB))$ ]] || { zk2_warn "a size like 512MiB or 2GiB, or 0"; SWAP=""; }
+done
+# false rather than empty: the same effect, but the config shows a decision.
+if [ "$SWAP" = 0 ]; then SWAP_CFG=false; else SWAP_CFG=$SWAP; fi
+
+if yesno "Docker inside (nesting and docker-ce)?" n; then DOCKER=true; else DOCKER=false; fi
+
+# --------------------------------------------------------------------------
+# Address
+# --------------------------------------------------------------------------
+
+# Taken addresses from two sources: configured and actual are not the same.
+# An instance without an override gets its address from dnsmasq and has none
+# in its config; offering that one as free means a conflict that shows up a
+# week later, at the next lease.
+TAKEN=$( { incus query "/1.0/instances?recursion=2" </dev/null | jq -r '
+    .[] | (.expanded_devices.eth0."ipv4.address" // empty),
+          ((.state.network // {}) | to_entries[] | select(.key != "lo")
+           | .value.addresses[]? | select(.family == "inet") | .address)'
+    echo "$CT_GATEWAY"
+    [ -z "${VPN_CT_IP:-}" ] || echo "$VPN_CT_IP"
+} | sort -u)
+ip_free() { ! grep -qxF "$1" <<<"$TAKEN"; }
+
+read -r NET_N NET_B _ < <(zk2_net "$CT_NET")
+SUGGEST=""
+for (( i = NET_N + 2; i < NET_B; i++ )); do
+    if ip_free "$(zk2_int2ip "$i")"; then SUGGEST=$(zk2_int2ip "$i"); break; fi
+done
+
+IP=""
+while [ -z "$IP" ]; do
+    ask IP "Address" "$SUGGEST"
+    if ! zk2_in_net "$IP" "$CT_NET"; then
+        zk2_err "not a host address of ${CT_NET}"; IP=""
+    elif ! ip_free "$IP"; then
+        zk2_err "${IP} is taken"; IP=""
+    fi
+done
+
+cat >&2 <<EOF
+
+  name        ${NAME}
+  image       ${IMAGE}
+  hostname    ${HOSTNAME_CT}
+  disk        ${DISK}
+  memory      ${RAM}
+  swap        $([ "$SWAP" = 0 ] && echo none || echo "${SWAP} on top of memory")
+  address     ${IP} (bridge ${CT_BRIDGE}, gateway ${CT_GATEWAY})
+  profiles    default, base
+  docker      $([ "$DOCKER" = true ] && echo "yes: security.nesting=true and docker-ce" || echo no)
+
+EOF
+yesno "Create?" y || { zk2_log "cancelled"; exit 0; }
+
+# --------------------------------------------------------------------------
+# Creation
+# --------------------------------------------------------------------------
+
+# Say where it broke. Without this, set -e ends the script with Incus having
+# the last word, which may not say whether the instance exists. A half-made
+# instance is not removed - it is stopped, harmless, and sometimes worth
+# looking at - but the command to remove it is printed.
+CREATED=0
+on_fail() {
+    local rc=$?
+    [ "$rc" = 0 ] && return 0
+    if [ "$CREATED" = 1 ]; then
+        zk2_err "setup of ${NAME} broke off: created, NOT configured, NOT started"
+        zk2_err "remove it with: incus delete -f ${NAME}"
+    else
+        zk2_err "${NAME} was not created"
+    fi
+    return "$rc"
+}
+trap on_fail EXIT
+
+run incus init "$IMAGE" "$NAME" -p default -p base </dev/null
+[ "$DRY_RUN" = 1 ] || CREATED=1
+
+run incus config set "$NAME" limits.memory="$RAM" </dev/null
+run incus config set "$NAME" limits.memory.swap="$SWAP_CFG" </dev/null
+# An own uid range, not the shared one: otherwise root of every container is
+# the same host uid and they share per-user kernel limits (see zk2-idmap).
+# Before the first start - changing the range later needs a stop.
+run incus config set "$NAME" security.idmap.isolated=true </dev/null
+# override, not "device add": the devices come from the profile default, and
+# add would create a second root and a second NIC next to them.
+run incus config device override "$NAME" root size="$DISK" </dev/null
+run incus config device override "$NAME" eth0 ipv4.address="$IP" </dev/null
+[ "$DOCKER" = false ] || run incus config set "$NAME" security.nesting=true </dev/null
+
+# Incus passes the instance name to cloud-init as the hostname; only a
+# different one is set. user-data, NOT vendor-data: the profile base lives in
+# vendor-data, and writing there would replace it - cloud-init keys do not
+# merge.
+if [ "$HOSTNAME_CT" != "$NAME" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  incus config set %s cloud-init.user-data=- (hostname: %s)\n' "$NAME" "$HOSTNAME_CT" >&2
+    else
+        printf '#cloud-config\nhostname: %s\npreserve_hostname: false\n' "$HOSTNAME_CT" \
+            | incus config set "$NAME" cloud-init.user-data=-
+    fi
+fi
+
+run incus start "$NAME" </dev/null
+trap - EXIT
+
+if [ "$DRY_RUN" = 1 ]; then
+    [ "$DOCKER" = false ] || printf '  then inside, after cloud-init: docker-ce, compose plugin, docker run --rm alpine true\n' >&2
+    zk2_warn "DRY RUN: nothing created"
+    exit 0
+fi
+zk2_ok "${NAME} created and started"
+
+# Wait for readiness, not for the start: right after incus start there is
+# neither systemd nor cloud-init inside, and exec fails with a vague error.
+if zk2_ct_wait_systemd "$NAME"; then
+    zk2_log "waiting for cloud-init (packages come from the network, this takes a while)..."
+    if incus exec "$NAME" -- cloud-init status --wait </dev/null >/dev/null 2>&1; then
+        zk2_ok "cloud-init done"
+    else
+        zk2_warn "cloud-init ended with an error - see /var/log/cloud-init-output.log inside"
+    fi
+else
+    zk2_warn "systemd inside did not come up within a minute - see incus info ${NAME}"
+fi
+
+# --------------------------------------------------------------------------
+# Docker inside
+# --------------------------------------------------------------------------
+#
+# A separate step after cloud-init rather than cloud-init's own: the profile
+# keeps its runcmd in vendor-data, and how cloud-init merges two lists of
+# that name would be tested on a new instance at a bad moment. An explicit
+# command has a visible exit code and output.
+#
+# Docker's repository, not the distribution package: AlmaLinux has no
+# docker-ce at all, Debian ships docker.io a version or two behind, without
+# the compose plugin. The docker group equals root on the instance; the user
+# from the profile has sudo ALL anyway.
+if [ "$DOCKER" = true ]; then
+    # shellcheck disable=SC2016
+    DOCKER_SCRIPT='set -e
+if command -v dnf >/dev/null 2>&1; then
+    dnf -y install dnf-plugins-core
+    dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+else
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -y install ca-certificates curl
+    install -m 0755 -d /etc/apt/keyrings
+    . /etc/os-release
+    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    printf "deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n" \
+        "$(dpkg --print-architecture)" "$ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/docker.list
+    apt-get update
+    apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+systemctl enable --now docker
+if id "$ZK2_USER" >/dev/null 2>&1; then usermod -aG docker "$ZK2_USER"; fi'
+    zk2_log "installing docker inside ${NAME}..."
+    if incus exec "$NAME" --env ZK2_USER="$CT_USER" -- bash -c "$DOCKER_SCRIPT" </dev/null; then
+        zk2_ok "docker installed, ${CT_USER} in the docker group"
+        # The check is the one that breaks: dockerd answers docker info without
+        # nesting too; the first container with its own network fails.
+        if incus exec "$NAME" -- docker run --rm alpine true </dev/null >/dev/null 2>&1; then
+            zk2_ok "docker run works - nesting is in place"
+        else
+            zk2_warn "docker is there, but 'docker run --rm alpine true' failed"
+            zk2_warn "check: incus config get ${NAME} security.nesting (true expected)"
+        fi
+    else
+        zk2_warn "docker installation failed - the instance works, install it inside by hand"
+    fi
+fi
+
+incus list "$NAME" </dev/null >&2
+cat >&2 <<EOF
+
+Next:
+  incus shell ${NAME}            root
+  ssh ${CT_USER}@${IP}           from the instance network or the VPN
+
+DO NOT FORGET, or the instance stays unwatched - in your fleet repository:
+  1. nodes/<node>/inventory.conf: a line for ${NAME} with its backup policy.
+     zk2-backup does not back up what is not there, zk2-health reports it.
+  2. nodes/<node>/restore.conf: ${NAME}@  ${NAME}  ${IP}  <wave>
+  3. if it is reachable from outside: nodes/<node>/publication/, then
+     zk2-deploy and zk2-publish apply on the node.
+EOF

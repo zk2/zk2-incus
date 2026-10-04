@@ -107,6 +107,7 @@ above (or `ZK2_FLEET`).
 |---|---|---|
 | `/opt/zk2/bin/` | zk2 commands | `zk2-deploy`, replaced as a whole |
 | `/opt/zk2/hooks/` | generic pre-backup hooks | `zk2-deploy`, replaced as a whole |
+| `/opt/zk2/cloud-init/` | first boot template of new instances | `zk2-deploy`, replaced as a whole |
 | `/opt/zk2/VERSION` | which zk2 is deployed | `zk2-deploy` |
 | `/usr/local/sbin/zk2-*` | links to `/opt/zk2/bin`, so commands are in `PATH` | `zk2-deploy` |
 | `/etc/zk2/node.conf` | node parameters | `zk2-deploy`, from your fleet |
@@ -115,15 +116,36 @@ above (or `ZK2_FLEET`).
 | `/etc/zk2/restore.conf` | restore map: archive, name, address, wave | `zk2-deploy`, from your fleet |
 | `/etc/zk2/hooks/` | your own pre-backup hooks | `zk2-deploy`, mirrored from your fleet |
 | `/etc/zk2/zk2-env.dist` | template of the secrets file | `zk2-deploy` |
-| `/etc/zk2/zk2-env` | secrets: borg repository and passphrase, report address | **you**, from the template, mode 600; never in git, never overwritten |
+| `/etc/zk2/zk2-env` | secrets: borg repository and passphrase, report address, instance passwords | **you**, from the template, mode 600; never in git, never overwritten |
 
-Once per node, after the first deploy, on the node:
+### A new node
+
+Install Debian 13 the way your provider does it: the OS on its own small
+RAID, the disks or partitions meant for instances left empty. Then:
 
 ```sh
-cp /etc/zk2/zk2-env.dist /etc/zk2/zk2-env && chmod 600 /etc/zk2/zk2-env
-editor /etc/zk2/zk2-env                  # BORG_REPO, BORG_PASSPHRASE, ZK2_EMAIL
-(set -a; . /etc/zk2/zk2-env; borg init --encryption=repokey-blake2)
+apt install rsync                               # on the node
+../zk2-incus/tools/zk2-fleet add-node node1     # in your fleet; edit node.conf:
+                                                #   ZFS_DISKS, SSH_PORT, CT_NET, ...
+../zk2-incus/tools/zk2-deploy node1
 ```
+
+On the node:
+
+```sh
+zk2-node-build --dry-run && zk2-node-build      # ZFS mirror, Incus, network, firewall
+cp /etc/zk2/zk2-env.dist /etc/zk2/zk2-env && chmod 600 /etc/zk2/zk2-env
+editor /etc/zk2/zk2-env                         # BORG_*, ZK2_EMAIL, instance passwords
+editor /etc/msmtprc                             # your SMTP relay
+(set -a; . /etc/zk2/zk2-env; borg init --encryption=repokey-blake2)
+zk2-base-profile                                # first boot setup of new instances
+zk2-publish apply
+zk2-new-ct                                      # first instance
+```
+
+zk2-node-build refuses disks that carry any signature unless `--force`, and
+its firewall lets in nothing but ssh on `SSH_PORT`: change the sshd port and
+`node.conf` together.
 
 Keep the passphrase and `borg key export --paper` outside the node: without
 them no archive can be read.
@@ -164,12 +186,15 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
 | `zk2-fleet` | workstation | create a fleet, add a node from the example |
+| `zk2-node-build` | node | build a node on fresh Debian 13: ZFS mirror, Incus from Zabbly, bridge, DHCP routes for the VPN, split DNS, host firewall |
+| `zk2-new-ct` | node | new instance by a short dialog: limits, isolated uid range, fixed address, cloud-init, docker if asked |
+| `zk2-base-profile` | node | the Incus profile base: user, passwords, ssh policy and keys, shell, packages - from `cloud-init/base.yaml` |
 | `zk2-nightly` | node | backup, host backup and health in order, one report |
 | `zk2-backup` | node | snapshot, read-only mount, borg: containers, VMs (files, or whole on the monthly policy), pre-backup database dumps, per-instance retention |
 | `zk2-host-backup` | node | the node's own root file system and a plain-text dump of its Incus state |
 | `zk2-restore` | node | restore by the map, in waves; one instance from a given archive; a probe under another name; limits from the host dump; whole VMs |
 | `zk2-archives` | node | what the repository holds, what is stale or missing, how to restore |
-| `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, backup inventory, leftover snapshots, publication drift |
+| `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, VPN routes, split DNS, backup inventory, leftover snapshots, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
 
@@ -191,8 +216,8 @@ Commands are named `zk2-<what>`, without an extension.
 
 ## Requirements
 
-- Debian 13 on two disks (mirrored ZFS pool for Incus)
-- Incus 6.x or newer
+- Debian 13 (kernel 6.12+), and two disks or partitions for the ZFS mirror
+- Incus 7 (zk2-node-build installs it from the Zabbly repository)
 - borg 1.2+ and an ssh-reachable borg repository for backups
 - An SMTP relay for the nightly report
 

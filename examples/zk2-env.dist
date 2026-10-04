@@ -40,3 +40,10 @@ BORG_REPO=ssh://backup@backup.example.org:22/./node1
 # means losing every backup: nothing can decrypt them. Keep the output of
 # "borg key export --paper" next to it.
 BORG_PASSPHRASE=""
+
+# Passwords for new instances: the profile base (zk2-base-profile) gives them
+# to CT_USER and root through cloud-init. Hashed on the node; the Incus
+# configuration keeps the hash, never the plain text - but here they are in
+# plain text, hence mode 600.
+ZK2_CT_USER_PASS=""
+ZK2_CT_ROOT_PASS=""

@@ -203,3 +203,40 @@ zk2_ct_config_apply() {
     [ -z "$extra" ] || zk2_warn "  devices NOT carried over, add them by hand: $(tr '\n' ' ' <<<"$extra")"
     return $rc
 }
+
+# --------------------------------------------------------------------------
+# IPv4 arithmetic for the instance network (CT_NET, any prefix length)
+# --------------------------------------------------------------------------
+
+# Word splitting on dots is the point here.
+# shellcheck disable=SC2086
+zk2_ip2int() { local IFS=.; set -- $1; echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )); }
+zk2_int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+
+# zk2_net NET - print "NETWORK_INT BROADCAST_INT PREFIX" for 10.20.0.0/24.
+zk2_net() {
+    local addr=${1%/*} len=${1#*/} n mask
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || return 1
+    mask=$(( len == 0 ? 0 : (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    n=$(( $(zk2_ip2int "$addr") & mask ))
+    echo "$n $(( n | (~mask & 0xFFFFFFFF) )) $len"
+}
+
+# zk2_in_net IP NET - true when IP is a host address of NET.
+zk2_in_net() {
+    local n b i
+    read -r n b _ < <(zk2_net "$2") || return 1
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    i=$(zk2_ip2int "$1")
+    [ "$i" -gt "$n" ] && [ "$i" -lt "$b" ]
+}
+
+# Defaults derived from node.conf: the bridge holds the first address of the
+# instance network unless CT_GATEWAY says otherwise.
+zk2_net_defaults() {
+    local n
+    CT_BRIDGE=${CT_BRIDGE:-incusbr0}
+    [ -n "${CT_NET:-}" ] || return 0
+    read -r n _ _ < <(zk2_net "$CT_NET") || zk2_die "CT_NET='${CT_NET}' is not a network like 10.20.0.0/24"
+    CT_GATEWAY=${CT_GATEWAY:-$(zk2_int2ip $(( n + 1 )))}
+}

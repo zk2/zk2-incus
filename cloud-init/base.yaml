@@ -1,0 +1,122 @@
+#cloud-config
+#
+# First boot setup of a new instance: packages, user, ssh, shell. Applied
+# through the profile base (key cloud-init.vendor-data), which zk2-base-profile
+# builds from this file, filling in the @...@ markers from node.conf and
+# zk2-env. No passwords in git.
+#
+# Works ONLY on the first start and ONLY with /cloud images: plain images
+# have no cloud-init inside and ignore this silently. A running instance is
+# not reconfigured by a profile change.
+#
+# One file for Debian/Ubuntu and RHEL-like families; the two differences
+# (mc and htop live in EPEL; the sudo group differs) are handled below.
+
+package_update: true
+package_upgrade: false
+
+# openssh-server is here on purpose: a cloud image may come without it, and
+# the first container then answers "Connection refused" on 22 while
+# "incus shell" works fine. tar is missing from some cloud images too, and
+# "incus exec NAME -- tar" is how files with symlinks are best moved in.
+packages:
+  - openssh-server
+  - vim
+  - wget
+  - git
+  - rsync
+  - tar
+  - net-tools
+
+# No "default" in the list on purpose: it would create the image's stock user
+# (debian, almalinux, ubuntu) next to ours. lock_passwd: false is required,
+# otherwise the user is created with a locked password and the hash is
+# ignored.
+users:
+  - name: '@USER@'
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: '@USER_HASH@'
+    sudo: ALL=(ALL) ALL
+    ssh_authorized_keys: @USER_KEYS@
+
+# expire: false, or the password counts as temporary and the first login
+# demands a change, breaking both ssh and automation.
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: '@ROOT_HASH@'
+      type: hash
+
+# "unchanged" means "do not touch sshd_config", and it must stay exactly
+# that. cloud-init sets passwords BEFORE packages are installed; in an image
+# without openssh-server there is no sshd_config yet, and any other value
+# makes cloud-init create one - a single PasswordAuthentication line. The
+# package arrives next, sees a "modified" config and leaves it, putting its
+# own beside it (.ucf-dist, .rpmnew). That stub has no Include of
+# sshd_config.d, no UsePAM, no sftp subsystem. Removing the key is not enough
+# either: RHEL images set "ssh_pwauth: false" in their own cloud.cfg, and
+# vendor-data is what overrides it.
+ssh_pwauth: unchanged
+
+# Debian and Ubuntu skel .bashrc sets PS1, HISTSIZE and HISTFILESIZE, and
+# ~/.bashrc runs AFTER /etc/profile.d, overriding zk2.sh below: a plain
+# prompt and a 1000-line history. bootcmd runs before users:, so the user is
+# created from the fixed skel. The assignment is replaced by ":" rather than
+# commented out - it sits inside if/case, and an empty branch would be a
+# syntax error. Running again (bootcmd runs every boot) changes nothing.
+bootcmd:
+  - |
+    f=/etc/skel/.bashrc
+    if [ -f "$f" ]; then
+        sed -i -E 's/^([[:space:]]*)((export[[:space:]]+)?(PS1|HISTSIZE|HISTFILESIZE)=)/\1: # zk2.sh: \2/' "$f"
+    fi
+
+write_files:
+  # ssh policy, set explicitly instead of trusting the image defaults. sshd
+  # takes the FIRST value it meets for a parameter, so a drop-in sorting
+  # before ours would win; none of the stock 50-* files sets these two.
+  - path: /etc/ssh/sshd_config.d/60-zk2.conf
+    permissions: '0600'
+    content: |
+      # From zk2 cloud-init/base.yaml (CT_SSH_PASSWORD, CT_SSH_ROOT in node.conf).
+      PasswordAuthentication @SSH_PASSWORD@
+      PermitRootLogin @SSH_ROOT@
+
+  - path: /root/.ssh/authorized_keys
+    permissions: '0600'
+    content: @ROOT_KEYS@
+
+  # One file instead of appending to /etc/bashrc: appending is not idempotent,
+  # and a prompt set in two places drifts apart. Red root, cyan user - the
+  # colour difference is the point.
+  - path: /etc/profile.d/zk2.sh
+    permissions: '0644'
+    content: |
+      # From zk2 cloud-init/base.yaml.
+      HISTSIZE=100000
+      HISTFILESIZE=100000
+      export HISTSIZE HISTFILESIZE
+      export PROMPT_COMMAND="history -a; history -c; history -r${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+      export TERM=${TERM:-xterm}
+      if [ "$(id -u)" -eq 0 ]; then
+          PS1='\[\033[31m\]\u\[\033[m\]@\[\033[32m\]\h:\[\033[33;1m\]\w\[\033[m\]$ '
+      else
+          PS1='\[\033[36m\]\u\[\033[m\]@\[\033[32m\]\h:\[\033[33;1m\]\w\[\033[m\]$ '
+      fi
+
+# mc and htop: in RHEL-like systems they are in EPEL. Not in packages above:
+# cloud-init installs that list in one dnf transaction, and epel-release from
+# the same list would not have enabled its repository yet.
+runcmd:
+  - |
+    if command -v dnf >/dev/null 2>&1; then
+        dnf -y install epel-release
+        dnf -y install mc htop
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get -y install mc htop
+    fi
+  # sshd last: the package may have just arrived, and cloud images often ship
+  # the service disabled. The unit is sshd on RHEL, ssh on Debian.
+  - systemctl enable --now sshd 2>/dev/null || systemctl enable --now ssh

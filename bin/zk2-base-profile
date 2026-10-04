@@ -1,0 +1,117 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Build or update the Incus profile "base": first boot setup of new instances
+# through cloud-init, from /opt/zk2/cloud-init/base.yaml.
+#
+#   zk2-base-profile             create or update the profile
+#   zk2-base-profile --dry-run   print the rendered document, change nothing
+#
+# Filled in from node.conf: CT_USER [admin], CT_SSH_PASSWORD [yes],
+# CT_SSH_ROOT [prohibit-password], CT_SSH_KEYS. From zk2-env:
+# ZK2_CT_USER_PASS and ZK2_CT_ROOT_PASS, hashed here - the Incus
+# configuration keeps the hash, never the plain text.
+#
+# The profile acts ONLY when an instance is created (zk2-new-ct does it):
+#   incus launch images:debian/13/cloud NAME -p default -p base
+# Running this again changes the profile, not the instances made from it.
+#
+# vendor-data, not user-data: cloud-init keys are plain Incus config keys,
+# and the same key in two profiles does not merge - the last one wins. The
+# base goes into vendor-data and leaves user-data free for a role or one
+# instance; cloud-init applies both.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus openssl jq
+
+TEMPLATE=${ZK2_BASE_YAML:-$(dirname "$(readlink -f "$0")")/../cloud-init/base.yaml}
+PROFILE=base
+
+DRY_RUN=0
+case "${1:-}" in
+    --dry-run) DRY_RUN=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+[ -r "$TEMPLATE" ] || zk2_die "no ${TEMPLATE} (zk2-deploy delivers it)"
+zk2_load_node
+# Passwords are required: a profile without them would create a user nobody
+# can log in as, found out on a new instance at a bad moment.
+zk2_load_env ZK2_CT_USER_PASS ZK2_CT_ROOT_PASS
+
+CT_USER=${CT_USER:-admin}
+CT_SSH_PASSWORD=${CT_SSH_PASSWORD:-yes}
+CT_SSH_ROOT=${CT_SSH_ROOT:-prohibit-password}
+CT_SSH_KEYS=${CT_SSH_KEYS:-}
+case "$CT_SSH_PASSWORD" in yes|no) ;; *) zk2_die "CT_SSH_PASSWORD must be yes or no" ;; esac
+case "$CT_SSH_ROOT" in yes|prohibit-password|no) ;; *) zk2_die "CT_SSH_ROOT must be yes, prohibit-password or no" ;; esac
+[[ "$CT_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || zk2_die "CT_USER='${CT_USER}' is not a valid user name"
+
+# Without keys and without passwords nobody gets in over ssh at all.
+if [ "$CT_SSH_PASSWORD" = no ] && [ -z "${CT_SSH_KEYS// /}" ]; then
+    zk2_warn "CT_SSH_PASSWORD=no and no CT_SSH_KEYS: ssh into new instances will refuse everyone (incus shell still works)"
+fi
+
+# Keys as JSON: a flow list for users[].ssh_authorized_keys and a quoted
+# string for root's authorized_keys. JSON is valid YAML here, and it escapes
+# whatever a key comment contains.
+USER_KEYS=$(printf '%s\n' "$CT_SSH_KEYS" | sed '/^[[:space:]]*$/d' | jq -R . | jq -sc .)
+ROOT_KEYS=$(printf '%s\n' "$CT_SSH_KEYS" | sed '/^[[:space:]]*$/d' | jq -Rs .)
+
+# SHA-512 crypt, the format passwd(1) writes. The hash alphabet is
+# [./A-Za-z0-9$], so "|" is a safe sed delimiter; "/" occurs in every hash.
+USER_HASH=$(openssl passwd -6 "$ZK2_CT_USER_PASS")
+ROOT_HASH=$(openssl passwd -6 "$ZK2_CT_ROOT_PASS")
+
+# Keys go in last and through a file: they contain "|" and "&", which sed
+# would take as syntax.
+RENDERED=$(sed -e "s|@USER@|${CT_USER}|g" \
+               -e "s|@USER_HASH@|${USER_HASH}|g" \
+               -e "s|@ROOT_HASH@|${ROOT_HASH}|g" \
+               -e "s|@SSH_PASSWORD@|${CT_SSH_PASSWORD}|g" \
+               -e "s|@SSH_ROOT@|${CT_SSH_ROOT}|g" "$TEMPLATE" \
+           | UK=$USER_KEYS RK=$ROOT_KEYS awk '
+               # ENVIRON, not -v: -v would turn the \n inside the JSON string
+               # into a real newline. index/substr, not gsub: "&" in a gsub
+               # replacement means the matched text.
+               function put(line, mark, val,   i) {
+                   while ((i = index(line, mark)) > 0)
+                       line = substr(line, 1, i - 1) val substr(line, i + length(mark))
+                   return line
+               }
+               { print put(put($0, "@USER_KEYS@", ENVIRON["UK"]), "@ROOT_KEYS@", ENVIRON["RK"]) }')
+
+# A marker left over means the template and this script drifted apart. In
+# the profile it would be a disaster in silence: cloud-init would take
+# "@ROOT_HASH@" as a password hash, the instance would be created, and root
+# would have a password nobody knows.
+if grep -q '@[A-Z_]\+@' <<<"$RENDERED"; then
+    zk2_err "markers left unfilled in ${TEMPLATE}:"
+    grep -o '@[A-Z_]\+@' <<<"$RENDERED" | sort -u >&2
+    exit 1
+fi
+[ "${RENDERED:0:13}" = "#cloud-config" ] || zk2_die "${TEMPLATE} does not start with #cloud-config"
+
+if [ "$DRY_RUN" = 1 ]; then
+    zk2_warn "DRY RUN: profile ${PROFILE} not changed"
+    sed -e "s|${USER_HASH}|<password hash of ${CT_USER}>|" -e "s|${ROOT_HASH}|<password hash of root>|" <<<"$RENDERED"
+    exit 0
+fi
+
+incus profile show "$PROFILE" </dev/null >/dev/null 2>&1 || incus profile create "$PROFILE" </dev/null >/dev/null
+
+# No devices in this profile: root and eth0 come from default, and mixing
+# them in here means one day an instance with two roots. "-" reads the value
+# from stdin, which is why this is a pipe.
+printf '%s\n' "$RENDERED" | incus profile set "$PROFILE" cloud-init.vendor-data=-
+
+# Read back. If "-" had not been taken as stdin, the key would hold "-", the
+# command would succeed, and the dead cloud-init would surface on a new
+# instance.
+BACK=$(incus profile get "$PROFILE" cloud-init.vendor-data </dev/null)
+[ "${BACK:0:13}" = "#cloud-config" ] || zk2_die "profile ${PROFILE} took the wrong document: '${BACK:0:40}'"
+zk2_ok "profile ${PROFILE} updated: user ${CT_USER}, ssh password ${CT_SSH_PASSWORD}, root ${CT_SSH_ROOT}, $(jq length <<<"$USER_KEYS") key(s)"

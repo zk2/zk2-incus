@@ -1,0 +1,516 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Build a node from scratch: fresh Debian 13 -> ZFS mirror -> Incus ->
+# network -> host firewall -> VPN route.
+#
+#   zk2-node-build --dry-run        show what would be done, change nothing
+#   zk2-node-build                  do it
+#   zk2-node-build --force          allow wiping disks that carry signatures
+#   zk2-node-build --firewall-only  rewrite the host firewall only, on a
+#                                   built node whose rules changed
+#
+# Before it, on a freshly installed Debian 13 (any installer: the OS on its
+# own small RAID, the disks or partitions for instances left empty):
+#
+#   apt install rsync                      # on the node
+#   zk2-deploy NODE                        # on the workstation
+#   zk2-node-build --dry-run && zk2-node-build      # on the node
+#
+# Everything it needs comes from /etc/zk2/node.conf: ZFS_DISKS, ZFS_POOL,
+# SSH_PORT, CT_BRIDGE, CT_NET, CT_GATEWAY, VPN_NET and VPN_CT_IP (optional),
+# DNS_SPLIT (optional), INCUS_CHANNEL.
+#
+# Idempotent: a second run skips what is done. Not decoration - something
+# always fails halfway through a node build, and starting over must be safe.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+
+DRY_RUN=0; FORCE=0; FIREWALL_ONLY=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY_RUN=1 ;;
+        --force) FORCE=1 ;;
+        --firewall-only) FIREWALL_ONLY=1 ;;
+        -h|--help) sed -n '4,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) zk2_die "unknown option: $a" ;;
+    esac
+done
+
+run() { if [ "$DRY_RUN" = 1 ]; then printf '  %s\n' "$*" >&2; else "$@"; fi; }
+
+# stdin closed for the whole script: the Incus client waits for the end of
+# stdin before talking to the daemon, and run over ssh without a terminal it
+# hangs forever. Nothing here reads input.
+exec </dev/null
+
+zk2_load_node
+zk2_net_defaults
+: "${CT_NET:?CT_NET is not set in node.conf}"
+SSH_PORT=${SSH_PORT:-22}
+ZFS_POOL=${ZFS_POOL:-tank}
+INCUS_CHANNEL=${INCUS_CHANNEL:-lts-7.0}
+VPN_NET=${VPN_NET:-}
+VPN_CT_IP=${VPN_CT_IP:-}
+# One API port on every node: peers are added with the same number.
+INCUS_API_PORT=8443
+NET_LEN=${CT_NET#*/}
+ZABBLY_FPR="4EFC 5906 96CB 15B8 7C73  A3AD 82CC 8797 C838 DCFD"
+
+if [ -n "$VPN_NET" ] && [ -z "$VPN_CT_IP" ]; then
+    zk2_die "VPN_NET is set but VPN_CT_IP is not: the route to the VPN pool needs the OpenVPN instance address"
+fi
+
+# --------------------------------------------------------------------------
+# 1. Checks before anything changes
+# --------------------------------------------------------------------------
+
+# A disk is ours only if the pool exists HERE and the disk carries its label.
+# The label alone survives a reinstall: a new partition laid over the old one
+# shows the old pool's label, has the same name as on every node, and would
+# pass as ours.
+disk_in_our_pool() {
+    local d=$1 dev info
+    zpool list "$ZFS_POOL" >/dev/null 2>&1 || return 1
+    for dev in "$d" "${d}1" "${d}p1" "${d}-part1"; do
+        [ -b "$dev" ] || continue
+        info=$(blkid -o export "$dev" 2>/dev/null || true)
+        case "$info" in *"TYPE=zfs_member"*"LABEL=${ZFS_POOL}"*|*"LABEL=${ZFS_POOL}"*"TYPE=zfs_member"*) return 0 ;; esac
+    done
+    return 1
+}
+
+step_checks() {
+    zk2_log "== checks"
+    zk2_require_root
+    : "${ZFS_DISKS:?ZFS_DISKS is not set in node.conf: disks for the mirror, for example \"/dev/nvme0n1p4 /dev/nvme1n1p4\"}"
+
+    # Incus 7 needs kernel 6.12+ and cgroup v2 only. Checked before install.
+    local kmaj kmin d sig busy n=0
+    kmaj=$(uname -r | cut -d. -f1); kmin=$(uname -r | cut -d. -f2)
+    if [ "$kmaj" -lt 6 ] || { [ "$kmaj" -eq 6 ] && [ "$kmin" -lt 12 ]; }; then
+        zk2_die "kernel $(uname -r); Incus 7 needs 6.12+ (Debian 13)"
+    fi
+    [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] || zk2_die "cgroup v2 is not mounted"
+    zk2_ok "kernel $(uname -r), cgroup v2"
+
+    for d in $ZFS_DISKS; do
+        [ -b "$d" ] || zk2_die "not a block device: ${d}"
+        # A disk already in OUR pool is the result of a previous run, not
+        # foreign data: zpool create leaves a GPT label, and without this
+        # check the second run trips over its own work.
+        if disk_in_our_pool "$d"; then
+            zk2_ok "${d} is already in pool ${ZFS_POOL}"; n=$(( n + 1 )); continue
+        fi
+        # The TYPE, not "blkid succeeded": for a PARTITION blkid always prints
+        # at least the PARTUUID and exits 0, so an empty partition would look
+        # occupied - and the cure, --force, would switch off the real guard.
+        sig=$(blkid -o value -s TYPE "$d" 2>/dev/null || true)
+        if [ -n "$sig" ] && [ "$FORCE" = 0 ]; then
+            blkid "$d" >&2 || true
+            zk2_die "${d} carries a signature (${sig}); if that is expected, run again with --force"
+        fi
+        # No "mount | grep -q": grep exits on the first match, the source gets
+        # SIGPIPE, and under pipefail the check would say "not mounted" about
+        # a mounted disk.
+        busy=$(lsblk -nro MOUNTPOINT "$d" 2>/dev/null | grep -c . || true)
+        [ "$busy" = 0 ] || zk2_die "${d} or one of its partitions is mounted"
+        n=$(( n + 1 ))
+    done
+    [ "$n" -ge 2 ] || zk2_die "a mirror needs at least two disks, ZFS_DISKS has ${n}"
+    zk2_ok "disks for the mirror: ${ZFS_DISKS}"
+}
+
+# --------------------------------------------------------------------------
+# 2. Tools a minimal install does not have
+# --------------------------------------------------------------------------
+#
+# curl and gpg to fetch and verify the Incus repository key; borg, jq and an
+# MTA because the backup, the health check and the nightly mail need them -
+# all three were missing on a fresh node the first time. msmtp-mta provides
+# /usr/sbin/sendmail; configure /etc/msmtprc by hand (it holds a password).
+# borgbackup is 1.4 in Debian 13; do not install borg 2, it needs a
+# repository conversion.
+step_prereqs() {
+    local c need=""
+    for c in curl gpg borg jq msmtp nft; do command -v "$c" >/dev/null 2>&1 || need+=" ${c}"; done
+    [ -n "$need" ] || { zk2_ok "curl, gpg, borg, jq, msmtp, nft present"; return 0; }
+    zk2_log "== installing:${need}"
+    run apt-get update -qq
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl gnupg ca-certificates borgbackup jq msmtp msmtp-mta nftables
+}
+
+# --------------------------------------------------------------------------
+# 3. ZFS
+# --------------------------------------------------------------------------
+
+# zfs-dkms is in contrib, and Debian installers enable main only.
+step_apt_contrib() {
+    local f changed=0
+    case "$(apt-cache policy zfs-dkms 2>/dev/null || true)" in *"Candidate: "[0-9]*) return 0 ;; esac
+    zk2_log "enabling the contrib component"
+    [ "$DRY_RUN" = 0 ] || { printf '  add contrib to the apt sources\n' >&2; return 0; }
+    if [ -f /etc/apt/sources.list ] && grep -qE '^deb(-src)? .* main' /etc/apt/sources.list; then
+        cp /etc/apt/sources.list /etc/apt/sources.list.zk2-backup
+        sed -i -E '/^deb(-src)? /{ /contrib/! s/([[:space:]])main([[:space:]]|$)/\1main contrib\2/ }' /etc/apt/sources.list
+        changed=1
+    fi
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [ -f "$f" ] || continue
+        if grep -q '^Components:.*main' "$f" && ! grep -q '^Components:.*contrib' "$f"; then
+            cp "$f" "${f}.zk2-backup"
+            sed -i 's/^\(Components:.*\)main/\1main contrib/' "$f"
+            changed=1
+        fi
+    done
+    [ "$changed" = 1 ] || zk2_warn "apt sources not recognized, enable contrib by hand"
+    apt-get update -qq
+    case "$(apt-cache policy zfs-dkms 2>/dev/null || true)" in
+        *"Candidate: "[0-9]*) zk2_ok "contrib enabled, zfs-dkms available" ;;
+        *) zk2_die "zfs-dkms still unavailable, check the apt sources" ;;
+    esac
+}
+
+has_zfs_module() {
+    [ -f "/lib/modules/$1/updates/dkms/zfs.ko" ] || [ -f "/lib/modules/$1/updates/dkms/zfs.ko.xz" ] \
+        || modinfo -k "$1" zfs >/dev/null 2>&1
+}
+
+step_zfs() {
+    zk2_log "== ZFS"
+    if ! command -v zpool >/dev/null 2>&1; then
+        run apt-get update -qq
+        step_apt_contrib
+        # The headers METAPACKAGE, not only the headers of the running
+        # kernel. Without it apt upgrade brings a new kernel without headers,
+        # dkms builds the module for the old kernels only, and the next reboot
+        # comes up without the pool and without a single instance. The
+        # versioned package stays next to it: right after install the running
+        # kernel and the newest one available are often different.
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            linux-headers-amd64 "linux-headers-$(uname -r)" zfs-dkms zfsutils-linux
+    else
+        zk2_ok "zfsutils installed"
+        case "$(dpkg-query -W -f='${Status}' linux-headers-amd64 2>/dev/null || true)" in
+            *"install ok installed"*) ;;
+            *) zk2_warn "linux-headers-amd64 missing - the next kernel would arrive without headers"
+               run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-headers-amd64 ;;
+        esac
+    fi
+
+    if [ "$DRY_RUN" = 0 ]; then
+        # Every installed kernel, not only the running one: a kernel arrives
+        # with apt upgrade, and a module that failed to build must be known
+        # BEFORE the reboot. Only the kernel that boots next is fatal.
+        local k next
+        next=$(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -1)
+        while IFS= read -r k; do
+            if has_zfs_module "$k"; then
+                printf '  %-32s module present%s\n' "$k" "$([ "$k" = "$next" ] && echo '  <- boots next')" >&2
+            elif [ "$k" = "$next" ]; then
+                zk2_die "kernel ${k} boots next and has NO ZFS module - fix it before any reboot"
+            else
+                zk2_warn "  ${k}: no ZFS module (older fallback kernel): apt-get install -y linux-headers-${k} && dkms autoinstall -k ${k}"
+            fi
+        done < <(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V)
+        modprobe zfs || zk2_die "the ZFS module does not load"
+        zk2_ok "ZFS $(cat /sys/module/zfs/version 2>/dev/null || echo '?')"
+    fi
+
+    if [ "$DRY_RUN" = 0 ] && zpool list "$ZFS_POOL" >/dev/null 2>&1; then
+        zk2_ok "pool ${ZFS_POOL} exists"
+    else
+        # ashift=12 for 4K sectors: NVMe drives reporting 512e would otherwise
+        # get ashift=9 for good - it cannot be changed without recreating the
+        # pool. xattr=sa and posixacl for container file systems.
+        # shellcheck disable=SC2086
+        run zpool create -f -o ashift=12 -O compression=zstd -O atime=off \
+            -O xattr=sa -O acltype=posixacl -m none "$ZFS_POOL" mirror $ZFS_DISKS
+        zk2_ok "pool ${ZFS_POOL} created as a mirror"
+    fi
+    [ "$DRY_RUN" = 1 ] || zpool status "$ZFS_POOL" >&2
+}
+
+# --------------------------------------------------------------------------
+# 4. Incus
+# --------------------------------------------------------------------------
+
+# "incus network show" answers for UNMANAGED interfaces too, so a leftover
+# from a previous attempt would pass as the network. Only "managed" tells.
+network_is_managed() {
+    case "$(incus network show "$1" 2>/dev/null || true)" in *"managed: true"*) return 0 ;; esac
+    return 1
+}
+
+# Leftovers of a failed attempt that Incus no longer manages but that hold
+# the bridge name and the gateway address: the bridge interface itself, and
+# a dnsmasq that outlived Incus holding GATEWAY:53 ("Address already in
+# use"). Only things tied to OUR bridge and not managed by Incus are touched.
+drop_stale_network() {
+    local pids
+    network_is_managed "$CT_BRIDGE" && return 0
+    pids=$(pgrep -f -- "--interface=${CT_BRIDGE}" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        zk2_warn "a dnsmasq from a previous attempt holds ${CT_GATEWAY} - stopping it"
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null || true
+        sleep 1
+    fi
+    if ip link show "$CT_BRIDGE" >/dev/null 2>&1; then
+        zk2_warn "bridge ${CT_BRIDGE} left from a previous attempt - removing it"
+        ip link delete "$CT_BRIDGE"
+    fi
+}
+
+step_incus() {
+    zk2_log "== Incus"
+    if ! command -v incus >/dev/null 2>&1; then
+        if [ "$DRY_RUN" = 0 ]; then
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+            # A third-party repository: the key is checked against the known
+            # fingerprint, not trusted because it downloaded.
+            local got
+            got=$(gpg --show-keys --fingerprint /etc/apt/keyrings/zabbly.asc 2>/dev/null | sed -n '2p' | sed 's/^ *//; s/ *$//')
+            [ "$got" = "$ZABBLY_FPR" ] || zk2_die "zabbly key fingerprint mismatch: ${got}"
+            zk2_ok "zabbly key fingerprint verified"
+            cat > /etc/apt/sources.list.d/zabbly-incus.sources <<EOF
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/${INCUS_CHANNEL}
+Suites: $(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '"')
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+        fi
+        run apt-get update -qq
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq incus
+    else
+        zk2_ok "Incus installed"
+    fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  incus storage create default zfs source=%s volume.zfs.use_refquota=true\n' "$ZFS_POOL" >&2
+        printf '  incus network create %s ipv4.address=%s/%s ipv4.nat=true ipv6.address=none\n' "$CT_BRIDGE" "$CT_GATEWAY" "$NET_LEN" >&2
+        [ -z "$VPN_NET" ] || printf '  incus network set %s ipv4.dhcp.routes=%s,%s,0.0.0.0/0,%s\n' "$CT_BRIDGE" "$VPN_NET" "$VPN_CT_IP" "$CT_GATEWAY" >&2
+        [ -z "${DNS_SPLIT:-}" ] || printf '  incus network set %s raw.dnsmasq=host-record=... (%s)\n' "$CT_BRIDGE" "$DNS_SPLIT" >&2
+        printf '  profile default: root on pool default, eth0 on %s; profile vm: root, eth0, agent:config\n' "$CT_BRIDGE" >&2
+        return 0
+    fi
+    zk2_ok "$(incus version | tr '\n' ' ')"
+
+    # Object by object, NOT "incus admin init --preseed": on an initialized
+    # node preseed tries to UPDATE existing objects, not create the missing
+    # ones, so a run that failed between storage and network could never be
+    # repeated ("Failed to update local member network: Network not found").
+
+    # volume.zfs.use_refquota=true: the root size becomes a ZFS refquota, not a
+    # quota. quota counts snapshots with the data, so an instance near its
+    # size hits it in the middle of a backup; refquota counts live data only.
+    if incus storage show default >/dev/null 2>&1; then
+        zk2_ok "storage pool default exists"
+    else
+        incus storage create default zfs source="$ZFS_POOL" volume.zfs.use_refquota=true
+        zk2_ok "storage pool default on ${ZFS_POOL}"
+    fi
+    [ "$(incus storage get default volume.zfs.use_refquota)" = true ] \
+        || { incus storage set default volume.zfs.use_refquota=true; zk2_ok "storage pool default: refquota"; }
+
+    drop_stale_network
+    if network_is_managed "$CT_BRIDGE"; then
+        zk2_ok "network ${CT_BRIDGE} exists"
+    else
+        incus network create "$CT_BRIDGE" ipv4.address="${CT_GATEWAY}/${NET_LEN}" ipv4.nat=true ipv6.address=none
+        zk2_ok "network ${CT_BRIDGE} created"
+    fi
+
+    # The route to the VPN pool, handed to the instances by DHCP. WITHOUT IT
+    # VPN CLIENTS CANNOT TALK TO INSTANCES, and the symptom misleads: ping
+    # works, the port opens, sshd logs the connection, and the session hangs.
+    #
+    # The path was asymmetric. The client's packet reaches the instance over
+    # the bridge straight from the OpenVPN container; the reply goes to the
+    # default gateway, the node, which knows the VPN route. For the node's
+    # conntrack that is a NEW outgoing connection from the instance network,
+    # and the bridge's ipv4.nat rule masquerades it. The client gets a reply
+    # from the wrong address and drops it. (On a node where some instance has
+    # an ACL, bridge conntrack records the client's packet first and hides
+    # the problem - which is how it survives unnoticed on one node and bites
+    # on the next.) With this route the reply goes to the OpenVPN container
+    # directly, and instances see real client addresses.
+    #
+    # The SECOND route in the value is required, not redundant: RFC 3442 says
+    # a client that receives option 121 must ignore option 3 (routers). Without
+    # 0.0.0.0/0 here, instances lose their default route - not at once, but at
+    # the next ifup or reboot, weeks later, with no visible link to the cause.
+    if [ -n "$VPN_NET" ]; then
+        incus network set "$CT_BRIDGE" ipv4.dhcp.routes="${VPN_NET},${VPN_CT_IP},0.0.0.0/0,${CT_GATEWAY}"
+        zk2_ok "DHCP routes: ${VPN_NET} via ${VPN_CT_IP}, default via ${CT_GATEWAY}"
+    else
+        incus network unset "$CT_BRIDGE" ipv4.dhcp.routes 2>/dev/null || true
+    fi
+
+    # Split DNS: own domains resolve to the internal front from inside. An
+    # instance calling its own public domain would otherwise go to the
+    # node's public address and back through DNAT, which does not work.
+    # host-record, not address=/name/: address= takes every subdomain along.
+    if [ -n "${DNS_SPLIT:-}" ]; then
+        local raw="" pair
+        for pair in $DNS_SPLIT; do raw+="host-record=${pair%%=*},${pair##*=}"$'\n'; done
+        incus network set "$CT_BRIDGE" "raw.dnsmasq=${raw%$'\n'}"
+        zk2_ok "split DNS: ${DNS_SPLIT}"
+    else
+        incus network unset "$CT_BRIDGE" raw.dnsmasq 2>/dev/null || true
+    fi
+
+    # Device by device: a previous run may have added root and failed on eth0.
+    incus profile device get default root path >/dev/null 2>&1 \
+        || incus profile device add default root disk pool=default path=/
+    incus profile device get default eth0 network >/dev/null 2>&1 \
+        || incus profile device add default eth0 nic network="$CT_BRIDGE" name=eth0
+    zk2_ok "profile default: root, eth0"
+
+    # VMs need the agent:config disk - without it a VM is not created at all
+    # ("This virtual machine image requires an agent:config disk"), and the
+    # agent is what makes incus exec and the address display work. A profile
+    # of its own: mixing container and VM devices in default ends in surprise.
+    if ! incus profile show vm >/dev/null 2>&1; then
+        incus profile create vm >/dev/null
+        incus profile device add vm root  disk pool=default path=/ size=20GiB >/dev/null
+        incus profile device add vm eth0  nic  network="$CT_BRIDGE" name=eth0 >/dev/null
+        incus profile device add vm agent disk source=agent:config >/dev/null
+        zk2_ok "profile vm created"
+    fi
+    # The profile base is not built here: it needs the passwords from
+    # zk2-env, which a bare node does not have yet. See the summary.
+}
+
+# --------------------------------------------------------------------------
+# 5. Host firewall
+# --------------------------------------------------------------------------
+#
+# Our own table only. Incus keeps its rules in "inet incus" and "bridge
+# incus"; Debian's stock /etc/nftables.conf starts with "flush ruleset",
+# which would wipe both together with the whole instance network - so that
+# file is rewritten to include our directory instead.
+#
+# No forward chain on purpose: Incus allows traffic to instances in its own
+# table, and a drop verdict in one table overrides an accept in another - a
+# forward chain with policy drop here would kill every published port.
+step_firewall() {
+    zk2_log "== host firewall"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  write /etc/nftables.d/zk2.nft (ssh %s, Incus API %s to peers, DHCP/DNS on %s)\n' "$SSH_PORT" "$INCUS_API_PORT" "$CT_BRIDGE" >&2
+        printf '  rewrite /etc/nftables.conf without flush ruleset\n' >&2
+        return 0
+    fi
+    mkdir -p /etc/nftables.d
+    cat > /etc/nftables.d/zk2.nft <<EOF
+#!/usr/sbin/nft -f
+# Written by zk2-node-build. Protects the host only; our own table.
+# "destroy table" touches only this table and does not fail when it is absent.
+destroy table inet zk2
+
+table inet zk2 {
+    # Incus API for peer nodes (incus copy/move between them). Empty until a
+    # file sorting after this one (zz-*.nft) fills it. The address does not
+    # protect from a peer's containers, which leave under the same address;
+    # Incus mTLS does.
+    set peers {
+        type ipv4_addr
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+        tcp dport ${SSH_PORT} accept
+        ip saddr @peers tcp dport ${INCUS_API_PORT} accept
+        # dnsmasq of Incus on the bridge: Incus allows it in its own table,
+        # but our drop policy would still cover it.
+        iifname "${CT_BRIDGE}" udp dport { 53, 67 } accept
+        iifname "${CT_BRIDGE}" tcp dport 53 accept
+    }
+}
+EOF
+    cat > /etc/nftables.conf <<'EOF'
+#!/usr/sbin/nft -f
+# NO "flush ruleset" here on purpose: it would wipe the Incus tables together
+# with the whole instance network.
+include "/etc/nftables.d/*.nft"
+EOF
+    chmod 755 /etc/nftables.conf
+    systemctl enable nftables.service >/dev/null 2>&1 || true
+    nft -f /etc/nftables.conf
+    zk2_ok "table inet zk2 applied, enabled at boot (ssh on ${SSH_PORT} only)"
+}
+
+# --------------------------------------------------------------------------
+# 6. Route to the VPN pool on the node
+# --------------------------------------------------------------------------
+#
+# A unit, not /etc/network/interfaces: the bridge is created by Incus, there
+# is nothing to route through before it starts. WantedBy=incus.service as
+# well: Requires= takes the route down with incus but does not bring it back
+# when incus starts again (a package upgrade restarts it).
+step_vpn_route() {
+    [ -n "$VPN_NET" ] || { zk2_log "== no VPN_NET: VPN route skipped"; return 0; }
+    zk2_log "== route to ${VPN_NET}"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  unit zk2-vpn-route.service: ip route replace %s via %s dev %s\n' "$VPN_NET" "$VPN_CT_IP" "$CT_BRIDGE" >&2
+        return 0
+    fi
+    cat > /etc/systemd/system/zk2-vpn-route.service <<EOF
+[Unit]
+Description=Route to the VPN client pool through the OpenVPN instance (zk2)
+After=incus.service
+Requires=incus.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ip route replace ${VPN_NET} via ${VPN_CT_IP} dev ${CT_BRIDGE}
+ExecStop=/sbin/ip route del ${VPN_NET} via ${VPN_CT_IP} dev ${CT_BRIDGE}
+
+[Install]
+WantedBy=multi-user.target incus.service
+EOF
+    systemctl daemon-reload
+    # reenable: a unit enabled before keeps its old links otherwise.
+    systemctl reenable zk2-vpn-route.service >/dev/null 2>&1
+    systemctl start zk2-vpn-route.service || zk2_warn "the route did not come up"
+    ip route show "$VPN_NET" >&2
+}
+
+# --------------------------------------------------------------------------
+
+[ "$DRY_RUN" = 0 ] || zk2_warn "DRY RUN: nothing is changed"
+if [ "$FIREWALL_ONLY" = 1 ]; then
+    zk2_require_root
+    step_firewall
+    exit 0
+fi
+
+step_checks
+step_prereqs
+step_zfs
+step_incus
+step_firewall
+step_vpn_route
+
+zk2_ok "node build finished"
+cat >&2 <<EOF
+
+Next, on the node:
+  1. /etc/zk2/zk2-env from zk2-env.dist, mode 600, and /etc/msmtprc for mail
+  2. borg init (see the README), then: zk2-base-profile
+  3. zk2-publish apply
+  4. instances: zk2-new-ct, or zk2-restore wave 1 ... on the day of a disaster
+  5. cron: 0 3 * * * root /usr/local/sbin/zk2-nightly
+EOF

@@ -17,8 +17,8 @@
 # ZFS, a disk that failed while the pool still said ONLINE, an instance
 # without a memory limit, a port opened by hand.
 #
-# Checks for other parts of zk2 (VPN routes, monitoring) join this file
-# together with those parts.
+# Checks for other parts of zk2 (monitoring) join this file together with
+# those parts.
 #
 # Settings, all optional, in node.conf:
 #   ZFS_POOL       pool that must exist (all pools are checked regardless)
@@ -47,6 +47,7 @@ esac
 
 zk2_load_node
 zk2_try_env
+zk2_net_defaults
 
 ZFS_POOL=${ZFS_POOL:-}
 POOL_PCT=${POOL_PCT:-85}
@@ -323,6 +324,42 @@ if zk2_ct_running "$VPN_CT"; then
     incus exec "$VPN_CT" -- sh -c '[ ! -e /etc/openvpn/crl.pem ] || su -s /bin/sh -c "test -r /etc/openvpn/crl.pem" nobody' \
         </dev/null >/dev/null 2>&1 \
         || add "VPN: crl.pem is not readable by nobody - client revocation DOES NOT WORK"
+fi
+
+# --------------------------------------------------------------------------
+# Network settings made by zk2-node-build
+#
+# They live in the node's Incus and routing configuration, not in git, and
+# disappear quietly with any rebuild or manual change - hence a check.
+# --------------------------------------------------------------------------
+
+if [ -n "${VPN_NET:-}" ] && [ -n "${VPN_CT_IP:-}" ]; then
+    # The route on the node: without it VPN clients quietly stop seeing the
+    # instances.
+    ip route show "$VPN_NET" 2>/dev/null | grep -q . \
+        || add "NO ROUTE to ${VPN_NET} - VPN clients cannot reach the instances (systemctl start zk2-vpn-route)"
+    # The route handed to instances by DHCP. A value without 0.0.0.0/0 is the
+    # dangerous case, not a nearly right one: per RFC 3442 instances then
+    # lose their default route at the next ifup.
+    want="${VPN_NET},${VPN_CT_IP},0.0.0.0/0,${CT_GATEWAY}"
+    got=$(incus network get "$CT_BRIDGE" ipv4.dhcp.routes </dev/null 2>/dev/null || true)
+    if [ -z "$got" ]; then
+        add "network ${CT_BRIDGE}: no ipv4.dhcp.routes - instances answer VPN clients through the node, which rewrites the address"
+    elif [ "${got#*0.0.0.0/0,}" = "$got" ]; then
+        add "network ${CT_BRIDGE}: ipv4.dhcp.routes has no 0.0.0.0/0 - instances lose their default route at the next ifup (RFC 3442)"
+    elif [ "$got" != "$want" ]; then
+        add "network ${CT_BRIDGE}: ipv4.dhcp.routes=${got}, expected ${want}"
+    fi
+fi
+
+if [ -n "${DNS_SPLIT:-}" ]; then
+    got=$(incus network get "$CT_BRIDGE" raw.dnsmasq </dev/null 2>/dev/null || true)
+    for pair in $DNS_SPLIT; do
+        # Whole lines: as a substring, one host-record could match inside
+        # another.
+        grep -qxF "host-record=${pair%%=*},${pair##*=}" <<<"$got" \
+            || add "network ${CT_BRIDGE}: raw.dnsmasq lacks ${pair%%=*} -> ${pair##*=}; instances calling it go out and hang (zk2-node-build fixes it)"
+    done
 fi
 
 # --------------------------------------------------------------------------
