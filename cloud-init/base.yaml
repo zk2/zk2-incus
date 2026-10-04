@@ -58,6 +58,10 @@ chpasswd:
 # sshd_config.d, no UsePAM, no sftp subsystem. Removing the key is not enough
 # either: RHEL images set "ssh_pwauth: false" in their own cloud.cfg, and
 # vendor-data is what overrides it.
+#
+# cloud-init 22.2+ reports the string value as deprecated ("scheduled to be
+# removed in 27.2"), so status ends as "degraded done", exit code 2. It still
+# works; before 27.2 this needs another way to keep sshd_config untouched.
 ssh_pwauth: unchanged
 
 # Debian and Ubuntu skel .bashrc sets PS1, HISTSIZE and HISTFILESIZE, and

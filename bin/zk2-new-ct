@@ -243,11 +243,20 @@ zk2_ok "${NAME} created and started"
 # neither systemd nor cloud-init inside, and exec fails with a vague error.
 if zk2_ct_wait_systemd "$NAME"; then
     zk2_log "waiting for cloud-init (packages come from the network, this takes a while)..."
-    if incus exec "$NAME" -- cloud-init status --wait </dev/null >/dev/null 2>&1; then
-        zk2_ok "cloud-init done"
-    else
-        zk2_warn "cloud-init ended with an error - see /var/log/cloud-init-output.log inside"
-    fi
+    # Exit code 2 is "done, with recoverable errors" ("degraded done"), and
+    # deprecation warnings count as such - not a failure. Calling it an error
+    # on every new instance teaches you to ignore the line that one day is
+    # real. 2 shows what cloud-init complained about; anything else but 0 is
+    # a failure.
+    rc=0
+    incus exec "$NAME" -- cloud-init status --wait </dev/null >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) zk2_ok "cloud-init done" ;;
+        2) zk2_ok "cloud-init done, with warnings:"
+           incus exec "$NAME" -- cloud-init status --long </dev/null 2>/dev/null \
+               | sed -n '/^recoverable_errors:/,$p' | sed '1d; s/^/    /' >&2 ;;
+        *) zk2_warn "cloud-init FAILED (exit ${rc}) - see cloud-init status --long and /var/log/cloud-init-output.log inside" ;;
+    esac
 else
     zk2_warn "systemd inside did not come up within a minute - see incus info ${NAME}"
 fi
