@@ -165,7 +165,7 @@ rssh 'command -v rsync >/dev/null' \
 #
 # A missing file is said aloud: a peer silently left out would look set up.
 build_peers() {
-    local out=$1 d peer ip port sfp cfp
+    local out=$1 d peer ip port sfp cfp hk
     mkdir -p "$out"
     : > "${out}/ssh_config"; : > "${out}/ssh_known_hosts"; : > "${out}/ssh_authorized"; : > "${out}/incus_peers.conf"
     for d in "${FLEET}"/nodes/*/; do
@@ -180,7 +180,12 @@ build_peers() {
         printf 'Host %s\n    HostName %s\n    Port %s\n    User root\n    IdentityFile /root/.ssh/id_ed25519_nodes\n    IdentitiesOnly yes\n    UserKnownHostsFile /root/.ssh/known_hosts.d/zk2-nodes\n    StrictHostKeyChecking yes\n\n' \
             "$peer" "$ip" "$port" >> "${out}/ssh_config"
         if [ -r "${d}ssh/ssh_host_ed25519_key.pub" ]; then
-            printf '[%s]:%s %s\n' "$ip" "$port" "$(cut -d' ' -f1,2 "${d}ssh/ssh_host_ed25519_key.pub")" >> "${out}/ssh_known_hosts"
+            # "[address]:port" only for a non-default port: for port 22 ssh
+            # looks the host up by the bare address, and a bracketed entry is
+            # never found - "No ED25519 host key is known". Found on the test
+            # node, whose sshd is on 22.
+            if [ "$port" = 22 ]; then hk=$ip; else hk="[${ip}]:${port}"; fi
+            printf '%s %s\n' "$hk" "$(cut -d' ' -f1,2 "${d}ssh/ssh_host_ed25519_key.pub")" >> "${out}/ssh_known_hosts"
         else
             say "note: no nodes/${peer}/ssh/ssh_host_ed25519_key.pub - ssh ${peer} will fail host verification (zk2-fleet collect ${peer})"
         fi
