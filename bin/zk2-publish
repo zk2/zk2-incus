@@ -1,0 +1,325 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Published ports of a node: git is the source of truth, Incus is brought to it.
+#
+#   zk2-publish diff     compare the description with the node (default)
+#   zk2-publish apply    bring the node to the description
+#   zk2-publish show     print what is on the node now
+#
+# Incus does the heavy lifting: "incus network forward edit" and
+# "incus network acl edit" replace the whole object with the description and
+# drop whatever is not in it. So there is no reconciler here, and every apply
+# is atomic per object.
+#
+# The description lives in ZK2_CONF_DIR/publication (default /etc/zk2):
+#
+#   forward.yaml, forward-*.yaml   where each port goes, one file per
+#                                  listen address
+#   acl-<name>.yaml                who may connect
+#   acl-attach.conf                which ACLs are attached to which instance
+#                                  NIC (that is instance config, not a network
+#                                  object, hence a separate file)
+#
+# The YAML files are verbatim copies of "incus network forward show" and
+# "incus network acl show" output, so comparing them is a plain diff. There is
+# deliberately no format of our own: nothing to translate means nothing to get
+# wrong in translation. Comments in them are fine; Incus does not keep them,
+# so put the reasons for a port into its description field, which survives
+# a show -> edit -> show round trip.
+#
+# diff also reports what exists on the node but not in git: forwards on the
+# bridge, ACLs, and ACL attachments. apply only warns about those and never
+# deletes them; remove them by hand once you know where they came from.
+#
+# Exit code of diff: 0 when the node matches, 1 on any drift.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+
+CONF_DIR=${ZK2_CONF_DIR:-/etc/zk2}
+PUB_DIR=${ZK2_PUB_DIR:-${CONF_DIR}/publication}
+NODE_CONF=${ZK2_NODE_CONF:-${CONF_DIR}/node.conf}
+
+# This is a report rather than a log: plain lines, no timestamps.
+say()  { printf '%s\n' "$*" >&2; }
+ok()   { printf '%s%s%s\n' "$ZK2_GREEN"  "$*" "$ZK2_NC" >&2; }
+warn() { printf '%s%s%s\n' "$ZK2_YELLOW" "$*" "$ZK2_NC" >&2; }
+err()  { printf '%s%s%s\n' "$ZK2_RED"    "$*" "$ZK2_NC" >&2; }
+
+MODE=${1:-diff}
+case "$MODE" in
+    diff|apply|show) ;;
+    -h|--help) sed -n '4,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown mode: ${MODE} (diff, apply or show)" ;;
+esac
+
+zk2_require_cmd incus jq diff
+[ -d "$PUB_DIR" ] || zk2_die "no ${PUB_DIR}"
+
+CT_BRIDGE=""
+if [ -r "$NODE_CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$NODE_CONF"
+fi
+CT_BRIDGE=${CT_BRIDGE:-incusbr0}
+
+ATTACH_FILE="${PUB_DIR}/acl-attach.conf"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+DRIFT=0
+drift() { warn "  $*"; DRIFT=1; }
+
+# Every incus call below gets </dev/null. Several of them run inside
+# "while read" loops whose stdin is a file list, and "incus ... create"
+# without a terminal reads YAML from stdin: it silently eats the rest of the
+# list and fails on the first object that does not exist yet.
+
+# --------------------------------------------------------------------------
+# Comparison
+# --------------------------------------------------------------------------
+
+# "show" output carries fields our files do not have: used_by lists who
+# refers to the object, project and location are added by Incus. Our
+# comments are not stored by Incus either. All of these are dropped before
+# comparing, or every run would report drift.
+#
+# Quotes are stripped on both sides. YAML allows several spellings of one
+# value and Incus normalizes in its own way: "8080,8443" comes back as
+# 8080,8443, double quotes in a description come back as single ones.
+#
+# Long values are wrapped by Incus, so the same description is sometimes on
+# one line and sometimes on two; continuation lines are joined back.
+normalize() {
+    sed -e '/^used_by:/,/^[a-z]/{ /^used_by:/d; /^  - /d }' \
+        -e '/^project:/d' \
+        -e '/^location:/d' \
+        -e '/^[[:space:]]*#/d' \
+        -e '/^[[:space:]]*$/d' \
+    | awk '
+        /^[[:space:]]*-?[[:space:]]*[a-z_]+:/ {
+            if (buf != "") print buf
+            buf = $0
+            next
+        }
+        { sub(/^[[:space:]]+/, " "); buf = buf $0 }
+        END { if (buf != "") print buf }
+    ' \
+    | sed -E -e "s/^([[:space:]]*-?[[:space:]]*[a-z_]+):[[:space:]]*[\"'](.*)[\"'][[:space:]]*\$/\1: \2/"
+}
+
+# compare WHAT WANT GOT: unified diff, "-" is the node, "+" is git.
+compare() {
+    local what=$1 want=$2 got=$3
+    if diff -u --label node --label git \
+            <(printf '%s\n' "$got" | normalize) \
+            <(printf '%s\n' "$want" | normalize) >"$TMP" 2>&1; then
+        ok "  ${what}: matches"
+        return 0
+    fi
+    warn "  ${what}: DRIFT"
+    sed -e 's/^/    /' "$TMP" >&2
+    DRIFT=1
+}
+
+# --------------------------------------------------------------------------
+# ACLs
+# --------------------------------------------------------------------------
+
+acl_files() { find "$PUB_DIR" -maxdepth 1 -name 'acl-*.yaml' | sort; }
+acl_name()  { basename "$1" .yaml | sed 's/^acl-//'; }
+
+do_acls() {
+    local f name live
+    say "== ACLs"
+    while IFS= read -r f; do
+        name=$(acl_name "$f")
+        live=$(incus network acl show "$name" </dev/null 2>/dev/null || true)
+        case "$MODE" in
+            show)
+                say "-- ${name}"
+                printf '%s\n' "${live:-(none)}" >&2
+                ;;
+            diff)
+                if [ -z "$live" ]; then
+                    drift "acl ${name}: not on the node"
+                else
+                    # Incus adds a name field; ours comes from the file name.
+                    compare "acl ${name}" "$(cat "$f")" \
+                            "$(printf '%s\n' "$live" | sed '/^name:/d')"
+                fi
+                ;;
+            apply)
+                if [ -z "$live" ]; then
+                    incus network acl create "$name" </dev/null >/dev/null
+                    ok "  acl ${name}: created"
+                fi
+                incus network acl edit "$name" <"$f"
+                ok "  acl ${name}: applied"
+                ;;
+        esac
+    done < <(acl_files)
+
+    # ACLs on the node that git does not know about.
+    local known
+    known=$(acl_files | while IFS= read -r f; do acl_name "$f"; done)
+    while IFS= read -r name; do
+        grep -qxF -- "$name" <<<"$known" && continue
+        case "$MODE" in
+            show) say "-- ${name} (not in git)"
+                  incus network acl show "$name" </dev/null >&2 ;;
+            *)    drift "acl ${name}: on the node, not in git" ;;
+        esac
+    done < <(incus query /1.0/network-acls </dev/null | jq -r '.[] | sub(".*/"; "")')
+}
+
+# --------------------------------------------------------------------------
+# ACL attachments
+# --------------------------------------------------------------------------
+
+# Attaching an ACL to a NIC switches it to "only what is listed is allowed"
+# in BOTH directions. Without an explicit default for egress the instance
+# loses all outgoing traffic: package updates, external APIs, DNS. Egress is
+# therefore set to allow here, and before the ACL itself, so there is no
+# moment when the instance is cut off.
+#
+# Ingress is the opposite trap: everything not listed is rejected, including
+# neighbours on the instance network. If the instance has to be reachable
+# from the front proxy or other instances, the ACL must say so.
+EGRESS_KEY=security.acls.default.egress.action
+
+attach_wanted() {
+    [ -r "$ATTACH_FILE" ] || return 0
+    awk '!/^[[:space:]]*(#|$)/ { print $1, $2, $3 }' "$ATTACH_FILE"
+}
+
+do_attach() {
+    say "== ACL attachments"
+    [ -r "$ATTACH_FILE" ] || warn "  no ${ATTACH_FILE}"
+
+    local ct dev acls live_acls live_egress
+    while read -r ct dev acls; do
+        [ -n "$acls" ] || { warn "  cannot parse: ${ct} ${dev}"; continue; }
+        if ! incus info "$ct" </dev/null >/dev/null 2>&1; then
+            warn "  ${ct}: no such instance, skipped"
+            continue
+        fi
+        live_acls=$(incus config device get "$ct" "$dev" security.acls </dev/null 2>/dev/null || true)
+        live_egress=$(incus config device get "$ct" "$dev" "$EGRESS_KEY" </dev/null 2>/dev/null || true)
+
+        case "$MODE" in
+            show)
+                printf '  %-24s %-6s acls=%s egress=%s\n' \
+                       "$ct" "$dev" "${live_acls:-none}" "${live_egress:-none}" >&2
+                ;;
+            diff)
+                if [ "$live_acls" != "$acls" ]; then
+                    drift "${ct}/${dev}: acls '${live_acls}', git says '${acls}'"
+                elif [ "$live_egress" != allow ]; then
+                    drift "${ct}/${dev}: ${EGRESS_KEY} is not allow - no outgoing traffic"
+                else
+                    ok "  ${ct}/${dev}: acls=${acls}, egress allowed"
+                fi
+                ;;
+            apply)
+                incus config device set "$ct" "$dev" "$EGRESS_KEY"=allow </dev/null
+                incus config device set "$ct" "$dev" security.acls="$acls" </dev/null
+                ok "  ${ct}/${dev}: acls=${acls}, egress allowed"
+                ;;
+        esac
+    done < <(attach_wanted)
+
+    # Attachments on the node that git does not know about, profiles included.
+    local wanted
+    wanted=$(attach_wanted | awk '{ print $1, $2 }')
+    while read -r ct dev acls; do
+        grep -qxF -- "${ct} ${dev}" <<<"$wanted" && continue
+        case "$MODE" in
+            show) printf '  %-24s %-6s acls=%s (not in git)\n' "$ct" "$dev" "$acls" >&2 ;;
+            *)    drift "${ct}/${dev}: acls=${acls} on the node, not in git" ;;
+        esac
+    done < <(incus query "/1.0/instances?recursion=1" </dev/null | jq -r '
+        .[] | .name as $n | .expanded_devices | to_entries[]
+        | select((.value["security.acls"] // "") != "")
+        | "\($n) \(.key) \(.value["security.acls"])"')
+}
+
+# --------------------------------------------------------------------------
+# Forwards
+# --------------------------------------------------------------------------
+
+fwd_files() { find "$PUB_DIR" -maxdepth 1 \( -name 'forward.yaml' -o -name 'forward-*.yaml' \) | sort; }
+
+listen_addr() {
+    awk -F': *' '/^listen_address:/ { gsub(/["'\'']/, "", $2); print $2 }' "$1"
+}
+
+do_forwards() {
+    local f addr live known=""
+    say "== forwards on ${CT_BRIDGE}"
+    while IFS= read -r f; do
+        addr=$(listen_addr "$f")
+        [ -n "$addr" ] || zk2_die "no listen_address in ${f}"
+        known+="${addr}"$'\n'
+        live=$(incus network forward show "$CT_BRIDGE" "$addr" </dev/null 2>/dev/null || true)
+        case "$MODE" in
+            show)
+                say "-- ${addr}"
+                printf '%s\n' "${live:-(none)}" >&2
+                ;;
+            diff)
+                if [ -z "$live" ]; then
+                    drift "forward ${addr}: not on the node"
+                else
+                    compare "forward ${addr}" "$(cat "$f")" "$live"
+                fi
+                ;;
+            apply)
+                if [ -z "$live" ]; then
+                    incus network forward create "$CT_BRIDGE" "$addr" </dev/null >/dev/null
+                    ok "  forward ${addr}: created"
+                fi
+                incus network forward edit "$CT_BRIDGE" "$addr" <"$f"
+                ok "  forward ${addr}: applied"
+                ;;
+        esac
+    done < <(fwd_files)
+    [ -n "$known" ] || warn "  no forward*.yaml in ${PUB_DIR}"
+
+    while IFS= read -r addr; do
+        grep -qxF -- "$addr" <<<"$known" && continue
+        case "$MODE" in
+            show) say "-- ${addr} (not in git)"
+                  incus network forward show "$CT_BRIDGE" "$addr" </dev/null >&2 ;;
+            *)    drift "forward ${addr}: on the node, not in git" ;;
+        esac
+    done < <(incus query "/1.0/networks/${CT_BRIDGE}/forwards" </dev/null | jq -r '.[] | sub(".*/"; "")')
+}
+
+# --------------------------------------------------------------------------
+
+# Order matters for apply: ACLs and their attachments first, forwards last.
+# A new port is then published only when whatever restricts it is in place.
+case "$MODE" in
+    diff)  say "comparing git with the node:" ;;
+    apply) say "bringing the node to git:" ;;
+esac
+
+do_acls
+do_attach
+do_forwards
+
+case "$MODE" in
+    diff)
+        if [ "$DRIFT" = 0 ]; then
+            ok "publication matches git"
+        else
+            err "publication DIFFERS from git, see above"
+            exit 1
+        fi
+        ;;
+    apply)
+        ok "publication applied"
+        ;;
+esac

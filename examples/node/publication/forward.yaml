@@ -1,0 +1,40 @@
+# Ports published on the node's public address.
+#
+# The file must match the output of
+#   incus network forward show zk2br0 203.0.113.10
+# word for word (comments aside): zk2-publish diff is a plain diff with no
+# format translation in between.
+#
+# A file written by hand cannot be guaranteed to match before the first
+# "zk2-publish apply". The first diff after apply shows what Incus added on
+# its own, and then the file is fixed after the node, not the node after the
+# file.
+#
+# An empty port list is a valid state, not a placeholder: create the forward
+# anyway, so the nightly check does not report a missing object every night.
+# A false alarm in a daily report teaches you to stop reading the report.
+#
+# Reasons for a port go into its description: that field survives the
+# show -> edit -> show round trip, comments here do not reach the node.
+description: "Published ports of the example node"
+config: {}
+ports:
+  - description: "nginx front: http and https"
+    protocol: tcp
+    listen_port: "80,443"
+    target_port: ""
+    target_address: 10.20.0.10
+    snat: false
+  - description: "OpenVPN; snat so replies leave through the node address"
+    protocol: udp
+    listen_port: "1194"
+    target_port: ""
+    target_address: 10.20.0.20
+    snat: true
+  - description: "ssh to the app instance for CI deploys, source limited by ACL deploy"
+    protocol: tcp
+    listen_port: "2222"
+    target_port: "22"
+    target_address: 10.20.0.30
+    snat: false
+listen_address: 203.0.113.10

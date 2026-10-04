@@ -1,0 +1,25 @@
+# Who may reach the app instance. Attached in acl-attach.conf.
+#
+# The source address is checked AFTER the forward's DNAT, and DNAT does not
+# change the source: list the real addresses of your CI runners here, not the
+# node address. Ports are the ones INSIDE the instance (after translation):
+# 22, not the published 2222.
+#
+# Attaching an ACL rejects ALL incoming traffic that is not listed, not only
+# the deploy port. Without the last two rules the instance would also be cut
+# off from the front proxy and from VPN clients.
+description: "app: CI runners on ssh, front proxy and VPN clients"
+egress: []
+ingress:
+  - action: allow
+    source: 198.51.100.40
+    protocol: tcp
+    destination_port: "22"
+    state: enabled
+  - action: allow
+    source: 10.20.0.0/24
+    state: enabled
+  - action: allow
+    source: 10.20.100.0/24
+    state: enabled
+config: {}
