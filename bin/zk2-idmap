@@ -1,0 +1,119 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Container uid isolation and pipe usage per host uid. Read-only.
+#
+# Usage: zk2-idmap
+#
+# Why. Without security.idmap.isolated, root of every container on the node is
+# the same host uid (the start of the shared range, 1000000 by default), and
+# per-user kernel limits are shared by all of them. One that bites in practice
+# is fs.pipe-user-pages-soft (16384 pages per uid): once the containers
+# together hold more pipe pages than that, the kernel gives every new pipe of
+# that uid two pages (8 KiB) instead of the default 64 KiB. A process that
+# writes more than that to a pipe nobody drains promptly - a headless browser
+# logging to stderr, for example - then blocks, and it happens in a container
+# that did nothing wrong. A typical heavy holder is docker-proxy: its splice
+# pipes are grown to 1 MiB and kept after connections close.
+#
+# The first table shows readiness for isolation:
+#   ISO     security.idmap.isolated
+#   BASE    volatile.idmap.base: 0 = shared range, otherwise the start of the
+#           container's own range
+#   NEST    security.nesting (usually means docker inside)
+#   ISSUES  what to sort out before switching: a disk device with a host
+#           directory and no shift=true (its files would show up as nobody),
+#           or raw.idmap
+#
+# To switch a container: incus config set NAME security.idmap.isolated=true,
+# then restart it. The root filesystem is remapped on the next start.
+#
+# The second table counts pipe pages per host uid against the soft limit and
+# shows who holds what in the shared root uid. Other uids of the form
+# BASE+N are user N inside non-isolated containers, shared the same way. The
+# pipe size is asked from the kernel (F_GETPIPE_SZ) rather than assumed to be
+# 64 KiB, since some programs grow their pipes.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus jq perl getconf
+
+instances=$(incus query "/1.0/instances?recursion=1")
+
+# The start of the shared range is read from the actual map of a
+# non-isolated container instead of being guessed from configuration; with
+# no such container it falls back to the Incus default.
+base=$(jq -r '
+  [ .[] | select(.type == "container"
+                 and (.config["security.idmap.isolated"] // "false") != "true")
+        | .config["volatile.idmap.current"] // empty
+        | fromjson[] | select(.Isuid and .Nsid == 0) | .Hostid ] | first // empty
+' <<<"$instances")
+base=${base:-1000000}
+
+printf '%-26s %-8s %-5s %-10s %-5s %s\n' INSTANCE STATE ISO BASE NEST ISSUES
+jq -r <<<"$instances" '
+  .[] | select(.type == "container") |
+  [ .name, .status,
+    (.config["security.idmap.isolated"] // "-"),
+    (.config["volatile.idmap.base"] // "-"),
+    (.expanded_config["security.nesting"] // "-"),
+    ( [ (.expanded_devices | to_entries[]
+          | select(.value.type == "disk" and (.value.source // "") != ""
+                   and (.value.source | startswith("/"))
+                   and (.value.shift // "false") != "true")
+          | "disk " + .key + " " + .value.source),
+        (if (.config["raw.idmap"] // "") != "" then "raw.idmap" else empty end)
+      ] | join("; ") )
+  ] | @tsv' | sort | while IFS=$'\t' read -r n s iso b nest issues; do
+    printf '%-26s %-8s %-5s %-10s %-5s %s\n' "$n" "$s" "$iso" "$b" "$nest" "${issues:--}"
+done
+
+echo
+soft=$(cat /proc/sys/fs/pipe-user-pages-soft)
+perl -e '
+use strict; use Fcntl;
+my ($soft, $base, $pagesize) = @ARGV;
+my (%seen, %uid_pages, %ct_pages, %ct_n);
+opendir(my $d, "/proc") or die;
+for my $pid (grep { /^\d+$/ } readdir $d) {
+    my @st = stat("/proc/$pid") or next;
+    my $uid = $st[4];
+    next if $uid < $base;
+    my $ct = "-host-";
+    if (open(my $cg, "<", "/proc/$pid/cgroup")) {
+        local $/; my $c = <$cg>;
+        $ct = $1 if $c =~ m{lxc\.payload\.([^/\n]+)};
+    }
+    opendir(my $fdd, "/proc/$pid/fd") or next;
+    for my $fd (grep { /^\d+$/ } readdir $fdd) {
+        my $p = "/proc/$pid/fd/$fd";
+        my @fs = stat($p) or next;
+        next unless Fcntl::S_ISFIFO($fs[2]);
+        # The same pipe is open in many processes; count it once.
+        next if $seen{$fs[1]}++;
+        my $size = 0;
+        if (sysopen(my $fh, $p, O_RDONLY | O_NONBLOCK)) {
+            $size = fcntl($fh, 1032, 0) || 0;   # F_GETPIPE_SZ
+            close $fh;
+        }
+        my $pages = int($size / $pagesize);
+        $uid_pages{$uid} += $pages;
+        $ct_pages{"$uid $ct"} += $pages;
+        $ct_n{"$uid $ct"}++;
+    }
+}
+printf "%-10s %8s  %s\n", "UID", "PAGES", "OF fs.pipe-user-pages-soft = $soft";
+for my $u (sort { $uid_pages{$b} <=> $uid_pages{$a} } keys %uid_pages) {
+    my $mark = $uid_pages{$u} > $soft ? "  OVER: new pipes get 8 KiB" : "";
+    printf "%-10s %8d%s\n", $u, $uid_pages{$u}, $mark;
+}
+print "\nshared root uid $base by instance:\n";
+my @k = sort { $ct_pages{$b} <=> $ct_pages{$a} } grep { /^$base / } keys %ct_pages;
+print "  no pipes\n" unless @k;
+for my $k (@k) {
+    (my $ct = $k) =~ s/^\d+ //;
+    printf "  %8d pages %5d pipes  %s\n", $ct_pages{$k}, $ct_n{$k}, $ct;
+}
+' "$soft" "$base" "$(getconf PAGESIZE)"
