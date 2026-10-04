@@ -1,0 +1,337 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Table of the node's instances.
+#
+# Usage: zk2-list [--deep]
+#   (no option)  quick table, not a single incus exec
+#   --deep       plus the services inside running containers, see below
+#
+# Columns that are easy to miss elsewhere:
+#
+#   BACKUP  policy from the inventory; NOT-IN-INV is an instance nothing backs up
+#   IPV4    the address in CT_NET only. "incus list" also shows docker bridges
+#           (172.17.0.1 ...), and the real address - or its absence - drowns in
+#           them. A running instance without an address is up and unreachable.
+#   MEM     USED/LIMIT, DISK USED/SIZE. The right side may be "-", and that is
+#           the point: an instance without a limit takes the memory of the
+#           whole node and fills the pool. Limits are printed as set ("2GiB",
+#           "50%"), so a line can be pasted into incus config as is.
+#   SWAP    USED/CEILING from the cgroup of a running container, NOT from
+#           limits.memory.swap: true and false both mean no swap, only a size
+#           gives swap, and the config would claim "true" for containers that
+#           have none. "-" is no swap.
+#   NEST    security.nesting: without it docker inside starts but none of its
+#           containers does, and nothing else in the config shows why.
+#   SNAP    snapshots: one left by a failed backup holds space and grows.
+#   DISK%   used of the root size, also for a stopped instance - it can hit the
+#           size on its next start. POOL% is the share of the pool: sizes are
+#           thin, their sum exceeds the pool, and the pool can fill up before
+#           any instance reaches its own size.
+#   OS      from the container's own /etc/os-release, not from the image
+#           record: a container restored from an archive keeps the record of
+#           the image it was created from, whatever its root now holds.
+#
+# Red: running without an address, or a snapshot left over. Yellow: not
+# running, not in the inventory, or backup policy todo.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_cmd incus jq awk column
+
+DEEP=0
+case "${1:-}" in
+    --deep) DEEP=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+[ -r "$ZK2_NODE_CONF" ] && zk2_load_node
+INVENTORY=${ZK2_INVENTORY:-${ZK2_CONF_DIR}/inventory.conf}
+[ -r "$INVENTORY" ] || INVENTORY=/dev/null
+INCUS_DIR=${ZK2_INCUS_DIR:-/var/lib/incus}
+CGROUP_ROOT=${ZK2_CGROUP_ROOT:-/sys/fs/cgroup}
+
+# --------------------------------------------------------------------------
+# Data: one incus call per kind, one zfs call, then only file reads
+# --------------------------------------------------------------------------
+
+JSON=$(incus query "/1.0/instances?recursion=2" </dev/null)
+[ -n "$JSON" ] || zk2_die "incus returned nothing"
+
+# Dataset roots of the ZFS storage pools, asked from Incus ("tank",
+# "tank/incus", ...): instances live under ROOT/containers/NAME and
+# ROOT/virtual-machines/NAME(.block).
+ROOTS=$(incus query "/1.0/storage-pools?recursion=1" </dev/null 2>/dev/null \
+        | jq -r '.[] | select(.driver == "zfs") | .config["zfs.pool_name"] // .name' | tr '\n' ' ')
+POOL_SIZES=$(zpool list -H -p -o name,size 2>/dev/null | awk '{ printf "%s=%s ", $1, $2 }')
+
+# used includes snapshots, which is the point: a leftover backup snapshot
+# shows here as growth. A VM has two datasets - itself and its .block disk -
+# summed under one name, or a VM would show its config: kilobytes.
+# shellcheck disable=SC2086
+DISK=$( [ -z "$ROOTS" ] || zfs list -H -p -o name,used -r $ROOTS 2>/dev/null | awk -v roots="$ROOTS" '
+    BEGIN { n = split(roots, r, " ") }
+    {
+        for (i = 1; i <= n; i++) {
+            c = r[i] "/containers/"; v = r[i] "/virtual-machines/"
+            if (index($1, c) == 1) { name = substr($1, length(c) + 1) }
+            else if (index($1, v) == 1) { name = substr($1, length(v) + 1); sub(/\.block$/, "", name) }
+            else continue
+            if (name ~ /\//) continue
+            split(r[i], z, "/"); used[name] += $2; pool[name] = z[1]
+        }
+    }
+    END { for (k in used) print k, used[k], pool[k] }')
+
+# Fields separated by \037, NOT a tab: for read, a tab is whitespace even with
+# IFS=$'\t', consecutive tabs collapse, and a row with an empty field (the
+# address list of an instance without network) shifts left by one column.
+rows=$(jq -r '
+    .[] | [
+        .name, .status,
+        ( [ (.state.network // {}) | to_entries[] | select(.key != "lo")
+            | .value.addresses[]? | select(.family == "inet") | .address ] | join(",") ),
+        ( .state.memory.usage // 0 | tostring ),
+        ( .expanded_config["limits.memory"] // "-" ),
+        ( .state.processes // 0 | tostring ),
+        ( .expanded_config["security.nesting"] // "false" ),
+        ( .expanded_config["boot.autostart"] // "false" ),
+        ( (.snapshots // []) | length | tostring ),
+        ( .expanded_devices.root.size // "-" ),
+        .type,
+        ( .expanded_config["limits.memory.swap"] // "" ),
+        ( .expanded_devices.root.pool // "" )
+    ] | @tsv' <<<"$JSON" | tr '\t' '\037')
+
+enriched=""
+while IFS=$'\037' read -r name status ips mem lim proc nest auto snap size type swapcfg rootpool; do
+    [ -n "$name" ] || continue
+
+    # The address in CT_NET, not the first one: with docker inside there are
+    # several, and the first is almost never the right one.
+    ip=""
+    if [ -n "$ips" ]; then
+        for a in ${ips//,/ }; do
+            if [ -n "${CT_NET:-}" ] && zk2_in_net "$a" "$CT_NET"; then ip=$a; break; fi
+        done
+        [ -n "$ip" ] || ip=${ips%%,*}
+    fi
+
+    if [ "$type" = virtual-machine ]; then
+        # A VM's file system is inside its disk image; asking the agent would
+        # be an incus exec per VM, not for a quick table.
+        os="(vm)"
+    else
+        # An ABSOLUTE symlink inside the container, read from the host, leads
+        # into the HOST's file system: /etc/os-release is often a link to
+        # /usr/lib/os-release, and following it as is printed the node's own
+        # OS for every container.
+        ct_root="${INCUS_DIR}/storage-pools/${rootpool:-default}/containers/${name}/rootfs"
+        osfile="${ct_root}/etc/os-release"
+        if [ -L "$osfile" ]; then
+            target=$(readlink "$osfile")
+            case "$target" in /*) osfile="${ct_root}${target}" ;; *) osfile="${ct_root}/etc/${target}" ;; esac
+        fi
+        # "|| true": a stopped container has no mounted root, and under set -e
+        # with pipefail the failed pipe would end the whole table silently.
+        os=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$osfile" 2>/dev/null | head -1 || true)
+        os=${os:-"(stopped)"}
+    fi
+
+    read -r used zpool < <(awk -v n="$name" '$1 == n { print $2, $3; exit }' <<<"$DISK") || true
+
+    swused="" swmax=""
+    cg="${CGROUP_ROOT}/lxc.payload.${name}"
+    if [ "$type" != virtual-machine ] && [ -r "${cg}/memory.swap.max" ]; then
+        swmax=$(cat "${cg}/memory.swap.max" 2>/dev/null || true)
+        swused=$(cat "${cg}/memory.swap.current" 2>/dev/null || true)
+    fi
+
+    enriched+="${name}\t${status}\t${ip}\t${mem}\t${lim}\t${proc}\t${nest}\t${auto}\t${snap}\t${os}\t${used:-0}\t${size}\t${type}\t${swused}\t${swmax}\t${swapcfg}\t${zpool:-}"$'\n'
+done <<<"$rows"
+
+# Shared by both awk programs: the table and the summary count the same
+# things, and two copies would one day drift apart silently.
+AWK_FUNCS='
+    function iec(b,   units, i, v) {
+        split("B KiB MiB GiB TiB", units, " ")
+        v = b + 0; i = 1
+        while (v >= 1024 && i < 5) { v /= 1024; i++ }
+        return (v < 10) ? sprintf("%.1f%s", v, units[i]) : sprintf("%.0f%s", v, units[i])
+    }
+    # A limit string in bytes. -1: no limit at all; -2: a share ("50%"),
+    # which Incus accepts and which does not add up in bytes.
+    function tob(s,   n, u) {
+        if (s == "-" || s == "") return -1
+        if (s ~ /%$/) return -2
+        n = s + 0; u = s; sub(/^[0-9.]+/, "", u)
+        if (u == "KiB") return n * 1024
+        if (u == "MiB") return n * 1024 ^ 2
+        if (u == "GiB") return n * 1024 ^ 3
+        if (u == "TiB") return n * 1024 ^ 4
+        if (u == "kB")  return n * 1000
+        if (u == "MB")  return n * 1000 ^ 2
+        if (u == "GB")  return n * 1000 ^ 3
+        if (u == "TB")  return n * 1000 ^ 4
+        return n
+    }
+    # Percent of a limit; "-" when there is nothing to divide by.
+    function pct(used, lim,   b) {
+        b = tob(lim)
+        if (b <= 0) return "-"
+        return sprintf("%.0f", 100 * used / b)
+    }
+'
+
+# Colour AFTER alignment: column -t counts escape sequences as visible
+# characters. The last field of every row is the mark, cut off when printing.
+table=$(
+{
+    printf 'NAME\tTYPE\tBACKUP\tSTATE\tIPV4\tMEM\tMEM%%\tSWAP\tPROC\tNEST\tAUTO\tSNAP\tDISK\tDISK%%\tPOOL%%\tOS\t.\n'
+    printf '%b' "$enriched" | awk -F'\t' -v inv="$INVENTORY" -v pools="$POOL_SIZES" "$AWK_FUNCS"'
+        # "max" in memory.swap.max is no ceiling at all; Incus never writes it,
+        # but raw.lxc can, and showing it as "no swap" would be the very
+        # mistake this column exists to prevent.
+        function swap(type, used, max, cfg) {
+            if (type == "virtual-machine") return "-"
+            if (max != "") {
+                if (max == "0") return "-"
+                if (max == "max") return iec(used) "/max"
+                return iec(used) "/" (tob(cfg) == max + 0 ? cfg : iec(max))
+            }
+            if (cfg != "" && cfg != "true" && cfg != "false") return "-/" cfg
+            return "-"
+        }
+        BEGIN {
+            n = split(pools, pp, " ")
+            for (i = 1; i <= n; i++) { split(pp[i], kv, "="); poolsz[kv[1]] = kv[2] }
+            while ((getline line < inv) > 0) {
+                if (line ~ /^[[:space:]]*(#|$)/) continue
+                split(line, f, /[[:space:]]+/)
+                if (f[1] != "") policy[f[1]] = f[2]
+            }
+        }
+        NF < 13 { next }
+        {
+            name = $1; status = $2; ip = $3; running = (status == "Running")
+            bk = (name in policy) ? policy[name] : "NOT-IN-INV"
+            mark = "."
+            if (running && ip == "")  { ip = "NO ADDRESS"; mark = "R" }
+            else if ($9 + 0 > 0)      { mark = "R" }
+            else if (!running)        { mark = "Y" }
+            else if (bk == "NOT-IN-INV" || bk == "todo") { mark = "Y" }
+            if (ip == "") ip = "-"
+            share = (poolsz[$17] + 0 > 0) ? sprintf("%.1f", 100 * $11 / poolsz[$17]) : "-"
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                   name, ($13 == "virtual-machine" ? "vm" : "ct"), bk,
+                   (running ? "up" : "===" tolower(status) "==="), ip,
+                   (running ? iec($4) : "-") "/" $5, (running ? pct($4, $5) : "-"),
+                   swap($13, $14, $15, $16), (running ? $6 : "-"),
+                   ($7 == "true" ? "yes" : "-"), ($8 == "true" ? "yes" : "-"),
+                   ($9 + 0 ? $9 : "-"), iec($11) "/" $12, pct($11, $12), share, $10, mark
+        }' | sort
+} | column -t -s "$(printf '\t')")
+
+while IFS= read -r line; do
+    mark=${line##* }; body=${line% *}; body=${body%"${body##*[![:space:]]}"}
+    case "$mark" in
+        R) printf '%s%s%s\n' "$ZK2_RED" "$body" "$ZK2_NC" ;;
+        Y) printf '%s%s%s\n' "$ZK2_YELLOW" "$body" "$ZK2_NC" ;;
+        *) printf '%s\n' "$body" ;;
+    esac
+done <<<"$table"
+
+phys_kib=$(awk '/^MemTotal/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+printf '%b' "$enriched" | awk -F'\t' -v phys="${phys_kib:-0}" "$AWK_FUNCS"'
+    NF >= 13 {
+        n++; disk += $11
+        if ($13 == "virtual-machine") vm++
+        if ($2 == "Running") { run++; mem += $4 }
+        b = tob($5);  if (b == -1) memfree++;  else if (b == -2) mempct++;  else memlim  += b
+        b = tob($12); if (b == -1) diskfree++; else if (b == -2) diskpct++; else disklim += b
+    }
+    END {
+        printf "\nInstances: %d (%d vm), running %d\n", n, vm + 0, run
+        printf "Memory: used by running %s", iec(mem)
+        if (phys > 0) printf " of %s physical", iec(phys * 1024)
+        printf " | allocated %s", iec(memlim)
+        if (mempct  > 0) printf " plus %d by share", mempct
+        if (memfree > 0) printf ", NO LIMIT on %d", memfree
+        printf "\nDisk:   instances use %s | allocated %s", iec(disk), iec(disklim)
+        if (diskpct  > 0) printf " plus %d by share", diskpct
+        if (diskfree > 0) printf ", NO LIMIT on %d", diskfree
+    }'
+if command -v zpool >/dev/null 2>&1; then
+    zpool list -H -o name,size,alloc,free,cap,health 2>/dev/null \
+        | awk '{ printf " | pool %s: %s of %s (%s), %s", $1, $3, $2, $5, $6 } END { printf "\n" }'
+else
+    printf '\n'
+fi
+
+# --------------------------------------------------------------------------
+# --deep: services inside running containers
+#
+# The table answers "is the instance up". The question that matters is
+# whether what it exists for runs: an application whose venv is missing can
+# sit in a running container for months while backups and restore checks
+# report success. Two cheap checks:
+#
+#   1. failed units (systemctl --failed);
+#   2. ENABLED units whose ExecStart points to a missing file. Such a unit
+#      need not count as failed: with Restart=always systemd keeps it in
+#      "activating", out of --failed.
+#
+# Only enabled units, and those guarding themselves with a Condition on the
+# same path are skipped: rc-local.service exists everywhere and its file
+# almost nowhere - the same line for every container teaches you to skip the
+# whole section.
+# --------------------------------------------------------------------------
+
+[ "$DEEP" = 1 ] || exit 0
+
+printf '\n== services\n'
+problems=0 checked=0 unchecked=""
+while IFS=$'\037' read -r name status _ _ _ _ _ _ _ _ type _; do
+    [ "$status" = Running ] || continue
+    # A VM is reached by incus exec only through its agent; skipped aloud.
+    if [ "$type" = virtual-machine ]; then unchecked+=" ${name}"; continue; fi
+    checked=$(( checked + 1 ))
+
+    # "|| true" in both: a failing incus exec inside an assignment would end
+    # the section under set -e, and the instances after it would never be
+    # checked.
+    failed=$(incus exec "$name" -- systemctl --failed --no-legend --plain </dev/null 2>/dev/null \
+             | awk 'NF { print $1 }' || true)
+    # shellcheck disable=SC2016
+    missing=$(incus exec "$name" -- sh -c '
+        systemctl list-unit-files --state=enabled --no-legend --plain 2>/dev/null | awk "{ print \$1 }" \
+        | while read -r u; do
+            case "$u" in *.service) ;; *) continue ;; esac
+            f=$(systemctl show "$u" -p FragmentPath --value 2>/dev/null)
+            [ -n "$f" ] && [ -f "$f" ] || continue
+            grep -hoE "^ExecStart=-?/[^ ]+" "$f" | sed "s/^ExecStart=-\{0,1\}//" | sort -u \
+            | while read -r p; do
+                [ -x "$p" ] && continue
+                grep "^Condition" "$f" | grep -qF "$p" && continue
+                printf "%s -> %s\n" "$u" "$p"
+              done
+          done' </dev/null 2>/dev/null || true)
+
+    [ -z "$failed" ] && [ -z "$missing" ] && continue
+    problems=$(( problems + 1 ))
+    printf '%s%s%s\n' "$ZK2_YELLOW" "$name" "$ZK2_NC"
+    # shellcheck disable=SC2001
+    [ -z "$failed" ]  || sed 's/^/    failed:  /' <<<"$failed"
+    # shellcheck disable=SC2001
+    [ -z "$missing" ] || sed 's/^/    no exec: /' <<<"$missing"
+done <<<"$rows"
+
+if [ "$problems" = 0 ]; then
+    printf 'clean: %d containers checked, no failed units, every ExecStart exists\n' "$checked"
+else
+    printf '%d of %d containers with problems\n' "$problems" "$checked"
+fi
+[ -z "$unchecked" ] || printf 'not checked (vm, no incus exec):%s\n' "$unchecked"
+exit 0
