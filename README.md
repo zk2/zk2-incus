@@ -4,6 +4,9 @@ A small toolkit for running containers on your own dedicated servers with
 [Incus](https://linuxcontainers.org/incus/): one to a handful of nodes, no
 Kubernetes, no Proxmox, plain shell and git.
 
+The project and its commands are called zk2 (`zk2-deploy`, `zk2-publish`,
+...); the repository is `zk2-incus`.
+
 > **Status: work in progress.** The tools are being extracted from a private
 > setup that runs production workloads on several nodes. Until the first
 > release, expect missing pieces; see [What is there](#what-is-there).
@@ -47,7 +50,7 @@ data from your site onto that node.
 
 ```
 ~/infra/
-  zk2/          git clone https://github.com/zk2/zk2
+  zk2-incus/    git clone https://github.com/zk2/zk2-incus
   my-infra/     your private repository
     zk2-site.conf
     nodes/
@@ -58,15 +61,15 @@ data from your site onto that node.
 
 ```sh
 cd ~/infra
-git clone https://github.com/zk2/zk2
-zk2/tools/zk2-site init my-infra
+git clone https://github.com/zk2/zk2-incus
+zk2-incus/tools/zk2-site init my-infra
 cd my-infra && git init
-../zk2/tools/zk2-site add-node node1     # copies examples/node; edit it
-../zk2/tools/zk2-deploy --dry-run node1
-../zk2/tools/zk2-deploy node1
+../zk2-incus/tools/zk2-site add-node node1     # copies examples/node; edit it
+../zk2-incus/tools/zk2-deploy --dry-run node1
+../zk2-incus/tools/zk2-deploy node1
 ```
 
-Updating: `git -C ~/infra/zk2 pull`, then `zk2-deploy` each node. zk2 never
+Updating: `git -C ~/infra/zk2-incus pull`, then `zk2-deploy` each node. zk2 never
 sees your site: its `git status` stays clean, and nothing of yours can end
 up in it by accident.
 
@@ -80,15 +83,15 @@ own history:
 
 ```
 my-infra/
-  zk2/          git submodule -> github.com/zk2/zk2
+  zk2-incus/    git submodule -> github.com/zk2/zk2-incus
   zk2-site.conf
   nodes/...
 ```
 
 ```sh
-git submodule add https://github.com/zk2/zk2 zk2
-git -C zk2 checkout v0.1.0 && git add zk2 && git commit -m "zk2 v0.1.0"
-zk2/tools/zk2-deploy node1
+git submodule add https://github.com/zk2/zk2-incus
+git -C zk2-incus checkout v0.1.0 && git add zk2-incus && git commit -m "zk2 v0.1.0"
+zk2-incus/tools/zk2-deploy node1
 ```
 
 Upgrading is a commit in your repository ("zk2 v0.1.0 -> v0.2.0"), and
