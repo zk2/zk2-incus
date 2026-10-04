@@ -20,6 +20,7 @@
 #
 #   /opt/zk2/bin            zk2 commands, replaced as a whole on every deploy
 #   /opt/zk2/hooks          generic pre-backup hooks, the same way
+#   /opt/zk2/cloud-init     first boot template of new instances, the same way
 #   /opt/zk2/VERSION        git describe of the zk2 checkout that was deployed
 #   /usr/local/sbin/zk2-*   symlinks to /opt/zk2/bin, so the commands are in PATH
 #   /etc/zk2/node.conf      from nodes/<NODE>/node.conf
@@ -129,7 +130,15 @@ rssh() { ssh "${SSH_OPTS[@]}" "$NODE" "$@"; }
 # mkdir on the node, skipped in a dry run: rsync reports what it would create.
 rmkdir() { [ "$DRY_RUN" = 1 ] || rssh "mkdir -p $(q "$1")"; }
 
-RSYNC=(rsync -a --itemize-changes -e "ssh ${SSH_OPTS[*]}")
+# --mkpath (rsync 3.2.3+): missing destination directories are created - and
+# in a dry run only reported. Without it a dry run on a fresh node fails at
+# the first single file (node.conf), whose directory a dry run does not make.
+#
+# --no-owner --no-group: -a run as root on the receiving side would keep the
+# workstation's uid (usually 1000) on every file. /opt/zk2/bin holds what root
+# runs, and /opt and /etc are world-traversable: whoever has uid 1000 on the
+# node could replace them. Files land owned by root instead.
+RSYNC=(rsync -a --no-owner --no-group --mkpath --itemize-changes -e "ssh ${SSH_OPTS[*]}")
 [ "$DRY_RUN" = 1 ] && RSYNC+=(--dry-run)
 
 # Quote one value for the remote shell.
@@ -161,35 +170,41 @@ deploy_node() {
     rmkdir "${R_OPT}/hooks"
     "${RSYNC[@]}" --delete --chmod=D755,F755 --exclude README.md \
         "${ZK2_HOME}/hooks/" "${NODE}:${R_OPT}/hooks/"
+    rmkdir "${R_OPT}/cloud-init"
+    "${RSYNC[@]}" --delete --chmod=D755,F644 \
+        "${ZK2_HOME}/cloud-init/" "${NODE}:${R_OPT}/cloud-init/"
 
     say
     say "== data -> ${R_ETC}"
-    rmkdir "$R_ETC"
-    "${RSYNC[@]}" --chmod=F644 "${NODE_DIR}/node.conf" "${NODE}:${R_ETC}/node.conf"
-    # Mirrored too: zk2-publish takes the list of ACLs from the files here,
-    # and a file removed from git but left on the node keeps demanding an ACL
-    # that no longer exists.
+    # The top-level files go as ONE directory transfer from a staging copy:
+    # rsync creates a missing destination directory (and in a dry run reports
+    # it) only when the destination is a directory, so single files into a
+    # fresh /etc/zk2 would fail a dry run. No --delete here: zk2-env and
+    # anything else of the node's own in /etc/zk2 stay untouched.
+    local stage="${MUX_DIR}/etc" f
+    mkdir -p "$stage"
+    cp "${NODE_DIR}/node.conf" "$stage/"
+    for f in inventory.conf restore.conf; do
+        if [ -r "${NODE_DIR}/${f}" ]; then cp "${NODE_DIR}/${f}" "$stage/"
+        else say "note: no nodes/${NODE_NAME}/${f}"; fi
+    done
+    # The template sits next to the real file under another name, so it can
+    # never overwrite it.
+    cp "${ZK2_HOME}/examples/zk2-env.dist" "$stage/"
+    "${RSYNC[@]}" --chmod=D755,F644 "${stage}/" "${NODE}:${R_ETC}/"
+
+    # Mirrored: zk2-publish takes the list of ACLs from the files here, and a
+    # file removed from git but left on the node keeps demanding an ACL that
+    # no longer exists. Hooks the same way: one removed from git must not
+    # keep running; executable, because they are run directly.
     if [ -d "${NODE_DIR}/publication" ]; then
         "${RSYNC[@]}" --delete --chmod=D755,F644 \
             "${NODE_DIR}/publication/" "${NODE}:${R_ETC}/publication/"
     fi
-    local f
-    for f in inventory.conf restore.conf; do
-        if [ -r "${NODE_DIR}/${f}" ]; then
-            "${RSYNC[@]}" --chmod=F644 "${NODE_DIR}/${f}" "${NODE}:${R_ETC}/${f}"
-        else
-            say "note: no nodes/${NODE_NAME}/${f}"
-        fi
-    done
-    # Your hooks are mirrored as well: a hook removed from git must not keep
-    # running from an old deploy. Executable, because they are run directly.
     if [ -d "${NODE_DIR}/hooks" ]; then
         "${RSYNC[@]}" --delete --chmod=D755,F755 \
             "${NODE_DIR}/hooks/" "${NODE}:${R_ETC}/hooks/"
     fi
-    # The template goes next to the real file under another name, so it can
-    # never overwrite it.
-    "${RSYNC[@]}" --chmod=F644 "${ZK2_HOME}/examples/zk2-env.dist" "${NODE}:${R_ETC}/zk2-env.dist"
 
     [ "$DRY_RUN" = 1 ] && { say; say "(links, VERSION and checks skipped)"; return 0; }
 
