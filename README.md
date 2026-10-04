@@ -40,19 +40,19 @@ The project and its commands are called zk2 (`zk2-deploy`, `zk2-publish`,
 Two repositories:
 
 - **zk2** - this one, code only. You clone it and never edit it.
-- **your site** - your own private repository with one directory per node:
+- **your fleet** - your own private repository with one directory per node:
   `node.conf`, published ports, later the backup inventory and restore map.
 
 `zk2-deploy`, run on your workstation, puts the code from zk2 and a node's
-data from your site onto that node.
+data from your fleet onto that node.
 
-### Recommended: site next to zk2
+### Recommended: fleet next to zk2
 
 ```
 ~/infra/
   zk2-incus/    git clone https://github.com/zk2/zk2-incus
-  my-infra/     your private repository
-    zk2-site.conf
+  my-fleet/     your private repository
+    zk2-fleet.conf
     nodes/
       node1/
         node.conf
@@ -62,18 +62,18 @@ data from your site onto that node.
 ```sh
 cd ~/infra
 git clone https://github.com/zk2/zk2-incus
-zk2-incus/tools/zk2-site init my-infra
-cd my-infra && git init
-../zk2-incus/tools/zk2-site add-node node1     # copies examples/node; edit it
+zk2-incus/tools/zk2-fleet init my-fleet
+cd my-fleet && git init
+../zk2-incus/tools/zk2-fleet add-node node1     # copies examples/node; edit it
 ../zk2-incus/tools/zk2-deploy --dry-run node1
 ../zk2-incus/tools/zk2-deploy node1
 ```
 
 Updating: `git -C ~/infra/zk2-incus pull`, then `zk2-deploy` each node. zk2 never
-sees your site: its `git status` stays clean, and nothing of yours can end
+sees your fleet: its `git status` stays clean, and nothing of yours can end
 up in it by accident.
 
-Do not put your site inside the zk2 checkout, and do not keep your nodes in
+Do not put your fleet inside the zk2 checkout, and do not keep your nodes in
 a fork of zk2: a fork of a public repository on GitHub is public too.
 
 ### Pinned version: zk2 as a submodule
@@ -82,9 +82,9 @@ If you want every node on a version you chose, and upgrades recorded in your
 own history:
 
 ```
-my-infra/
+my-fleet/
   zk2-incus/    git submodule -> github.com/zk2/zk2-incus
-  zk2-site.conf
+  zk2-fleet.conf
   nodes/...
 ```
 
@@ -98,8 +98,8 @@ Upgrading is a commit in your repository ("zk2 v0.1.0 -> v0.2.0"), and
 rolling back is reverting it.
 
 In both layouts `zk2-deploy` delivers the code of the zk2 checkout it is run
-from, and finds your site by `zk2-site.conf` in the current directory or
-above (or `ZK2_SITE`).
+from, and finds your fleet by `zk2-fleet.conf` in the current directory or
+above (or `ZK2_FLEET`).
 
 ### On the node
 
@@ -108,8 +108,8 @@ above (or `ZK2_SITE`).
 | `/opt/zk2/bin/` | zk2 commands | `zk2-deploy`, replaced as a whole |
 | `/opt/zk2/VERSION` | which zk2 is deployed | `zk2-deploy` |
 | `/usr/local/sbin/zk2-*` | links to `/opt/zk2/bin`, so commands are in `PATH` | `zk2-deploy` |
-| `/etc/zk2/node.conf` | node parameters | `zk2-deploy`, from your site |
-| `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your site |
+| `/etc/zk2/node.conf` | node parameters | `zk2-deploy`, from your fleet |
+| `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your fleet |
 | `/etc/zk2/zk2-env` | secrets: borg passphrase, mail credentials | **you**, by hand, mode 600; never in git, never overwritten |
 
 Nightly report on the node, mailed to `ZK2_EMAIL` from `zk2-env` through
@@ -130,7 +130,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | Command | Where | What |
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
-| `zk2-site` | workstation | create a site, add a node from the example |
+| `zk2-fleet` | workstation | create a fleet, add a node from the example |
 | `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
@@ -145,7 +145,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | `containers/` | nginx front and OpenVPN gateway: configs and helper scripts |
 | `zabbix/` | optional monitoring: agent installer, templates, dashboard as code |
 | `tools/` | workstation tools: deploy to a node, check all vhosts, OpenVPN client control |
-| `examples/node/` | a fictional node, the template for `zk2-site add-node`: `node.conf`, published ports, later backup inventory and restore map |
+| `examples/node/` | a fictional node, the template for `zk2-fleet add-node`: `node.conf`, published ports, later backup inventory and restore map |
 | `docs/` | design notes: backup, node disaster recovery, migrating from OpenVZ 7 |
 | `contrib/` | optional provider-specific helpers |
 

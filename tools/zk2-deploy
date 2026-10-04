@@ -4,15 +4,15 @@
 #
 # Usage: zk2-deploy [--dry-run] NODE          code and node data
 #        zk2-deploy [--dry-run] NODE ROLE     config of one container role
-#        zk2-deploy --list                    nodes of the site
+#        zk2-deploy --list                    nodes of the fleet
 #
 # Two repositories meet here:
 #
 #   zk2    this repository, code only. The code delivered is the one from the
-#          checkout this script lives in, so a zk2 next to your site and a
-#          zk2 as a submodule of your site both work without configuration.
-#   site   your private repository with nodes/<NODE>/. Found by walking up
-#          from the current directory to a zk2-site.conf (ZK2_SITE overrides).
+#          checkout this script lives in, so a zk2 next to your fleet and a
+#          zk2 as a submodule of your fleet both work without configuration.
+#   fleet   your private repository with nodes/<NODE>/. Found by walking up
+#          from the current directory to a zk2-fleet.conf (ZK2_FLEET overrides).
 #          A marker file rather than a nodes/ directory, because a nodes/
 #          directory alone is too common a name to be trusted.
 #
@@ -31,7 +31,7 @@
 #
 # Container roles: nodes/<NODE>/deploy/<ROLE>.conf says which instance gets
 # which files; see examples/node/deploy/. Files are taken from
-# containers/<ROLE>/ in zk2 (shared) and nodes/<NODE>/<ROLE>/ in the site
+# containers/<ROLE>/ in zk2 (shared) and nodes/<NODE>/<ROLE>/ in the fleet
 # (local), staged on the node with rsync and pushed with "incus file push".
 # That route goes past the instance network: no sshd and no root key are
 # needed inside the container.
@@ -64,25 +64,25 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-find_site() {
+find_fleet() {
     local d
-    if [ -n "${ZK2_SITE:-}" ]; then
-        [ -r "${ZK2_SITE}/zk2-site.conf" ] || die "ZK2_SITE=${ZK2_SITE}: no zk2-site.conf there"
-        (cd "$ZK2_SITE" && pwd)
+    if [ -n "${ZK2_FLEET:-}" ]; then
+        [ -r "${ZK2_FLEET}/zk2-fleet.conf" ] || die "ZK2_FLEET=${ZK2_FLEET}: no zk2-fleet.conf there"
+        (cd "$ZK2_FLEET" && pwd)
         return
     fi
     d=$(pwd)
     while [ "$d" != / ]; do
-        [ -r "${d}/zk2-site.conf" ] && { echo "$d"; return; }
+        [ -r "${d}/zk2-fleet.conf" ] && { echo "$d"; return; }
         d=$(dirname "$d")
     done
-    die "no zk2-site.conf in $(pwd) or above. Run from your site, set ZK2_SITE, or create a site: zk2-site init DIR"
+    die "no zk2-fleet.conf in $(pwd) or above. Run from your fleet, set ZK2_FLEET, or create a fleet: zk2-fleet init DIR"
 }
 
-SITE=$(find_site)
+FLEET=$(find_fleet)
 
 list_nodes() {
-    find "${SITE}/nodes" -mindepth 2 -maxdepth 2 -name node.conf -printf '%h\n' 2>/dev/null \
+    find "${FLEET}/nodes" -mindepth 2 -maxdepth 2 -name node.conf -printf '%h\n' 2>/dev/null \
         | xargs -r -n1 basename | sort
 }
 
@@ -95,9 +95,9 @@ fi
 NODE_NAME=$1
 ROLE=${2:-}
 
-NODE_DIR="${SITE}/nodes/${NODE_NAME}"
+NODE_DIR="${FLEET}/nodes/${NODE_NAME}"
 [ -r "${NODE_DIR}/node.conf" ] || {
-    say "no ${NODE_DIR}/node.conf. Nodes of this site:"
+    say "no ${NODE_DIR}/node.conf. Nodes of this fleet:"
     list_nodes | sed 's/^/  /' >&2
     exit 1
 }
@@ -143,7 +143,7 @@ deploy_node() {
 
     say "node:    ${NODE_NAME} (${NODE})"
     say "zk2:     ${ZK2_HOME} (${version})"
-    say "site:    ${SITE}"
+    say "fleet:   ${FLEET}"
     [ "$DRY_RUN" = 1 ] && say "(dry run: nothing is changed)"
 
     say
@@ -210,7 +210,7 @@ deploy_node() {
 # A role's files come from TWO places on purpose:
 #
 #   zk2/containers/<role>/        shared by all nodes: nginx.conf, snippets
-#   site nodes/<node>/<role>/     local: the vhosts of this node
+#   fleet nodes/<node>/<role>/     local: the vhosts of this node
 #
 # Keeping per-node files in a shared directory fails in the worst way: nginx
 # -t does not care whether an upstream exists, so a vhost of another node
@@ -250,7 +250,7 @@ deploy_role() {
     #   NAME        instance that receives the files
     #   DEST        directory inside the instance
     #   FILES       from zk2/containers/<role>/ (optional)
-    #   NODE_FILES  from site nodes/<node>/<role>/ (optional)
+    #   NODE_FILES  from fleet nodes/<node>/<role>/ (optional)
     #   CHECK       command run in the instance after the push (optional)
     #   RELOAD      command run after CHECK succeeds (optional)
     #   ROLE        directory name if it differs from the file name (optional)
