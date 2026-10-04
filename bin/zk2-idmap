@@ -43,21 +43,24 @@ zk2_require_cmd incus jq perl getconf
 
 instances=$(incus query "/1.0/instances?recursion=1")
 
-# The start of the shared range is read from the actual map of a
+# The start of the shared range is read from the actual map of a running
 # non-isolated container instead of being guessed from configuration; with
-# no such container it falls back to the Incus default.
+# no such container it falls back to the Incus default. Only running
+# containers count, here and below: the map is refreshed on start, so a
+# stopped container may still carry the map it had before being switched
+# between shared and isolated.
 base=$(jq -r '
-  [ .[] | select(.type == "container"
+  [ .[] | select(.type == "container" and .status == "Running"
                  and (.config["security.idmap.isolated"] // "false") != "true")
         | .config["volatile.idmap.current"] // empty
         | fromjson[] | select(.Isuid and .Nsid == 0) | .Hostid ] | first // empty
 ' <<<"$instances")
 base=${base:-1000000}
 
-# Own ranges of isolated containers, as NAME:HOSTID:SIZE,... for the WHO
-# column. A stopped container has no current map; it holds no pipes either.
+# Own ranges of running isolated containers, as NAME:HOSTID:SIZE,... for the
+# WHO column. A stopped one holds no pipes, and its map may be stale.
 ranges=$(jq -r '
-  [ .[] | select(.type == "container"
+  [ .[] | select(.type == "container" and .status == "Running"
                  and .config["security.idmap.isolated"] == "true")
         | .name as $n
         | .config["volatile.idmap.current"] // empty
