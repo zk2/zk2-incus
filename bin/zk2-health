@@ -5,7 +5,12 @@
 #
 # Usage: zk2-health [--mail]
 #   (no option)  report to stdout; exit code 1 when there are findings
-#   --mail       mail the report when there are findings, stay silent otherwise
+#   --mail       mail the report; when exactly is MAIL_WHEN in node.conf:
+#                  always    every run, "OK" or "findings" in the subject
+#                            (default: a missing mail is then a signal too)
+#                  problems  only when there are findings; silence then also
+#                            looks like "did not run at all", so only choose
+#                            it if something else watches that it runs
 #
 # Run it nightly from cron with --mail. Every check here exists because its
 # problem stays invisible until it hurts: a kernel that will boot without
@@ -27,6 +32,7 @@
 #   CRL_DAYS       warn when the OpenVPN revocation list expires sooner (14)
 #   NESTED_OOM_OK  instances where OOM kills inside nested cgroups are normal
 #   NODE_NAME      name used in the mail subject (hostname)
+#   MAIL_WHEN      always or problems, see above (always)
 
 # shellcheck source=zk2-lib
 . "$(dirname "$(readlink -f "$0")")/zk2-lib"
@@ -52,6 +58,7 @@ VPN_CT=${VPN_CT:-openvpn}
 VPN_CERT_DAYS=${VPN_CERT_DAYS:-30}
 CRL_DAYS=${CRL_DAYS:-14}
 NODE_NAME=${NODE_NAME:-$(hostname -s)}
+MAIL_WHEN=${MAIL_WHEN:-always}
 
 STATE_DIR=${ZK2_STATE_DIR:-/var/lib/zk2}
 STATE="${STATE_DIR}/health.state"
@@ -342,15 +349,27 @@ fi
 # Report
 # --------------------------------------------------------------------------
 
-if [ -z "$findings" ]; then
-    [ "$MAIL" = 1 ] || echo "No findings."
-    exit 0
-fi
+case "$MAIL_WHEN" in
+    always|problems) ;;
+    # A typo must not switch the mail off quietly.
+    *) add "node.conf: MAIL_WHEN='${MAIL_WHEN}' not understood (always or problems), mailing as with always"
+       MAIL_WHEN=always ;;
+esac
 
-report=$(printf '%s\nzk2 %s on %s\n' "$findings" "$(zk2_version)" "$NODE_NAME")
-if [ "$MAIL" = 1 ]; then
-    zk2_mail "${NODE_NAME}: health findings" <<<"$report" || printf '%s\n' "$report"
+if [ -z "$findings" ]; then
+    rc=0
+    subject="${NODE_NAME}: health OK"
+    report="No findings."
 else
-    printf '%s\n' "$report"
+    rc=1
+    subject="${NODE_NAME}: health findings"
+    report=$findings
 fi
-exit 1
+report=$(printf '%s\n\nzk2 %s on %s\n' "${report%$'\n'}" "$(zk2_version)" "$NODE_NAME")
+
+if [ "$MAIL" = 0 ]; then
+    if [ "$rc" = 0 ]; then echo "No findings."; else printf '%s\n' "$report"; fi
+elif [ "$rc" = 1 ] || [ "$MAIL_WHEN" = always ]; then
+    zk2_mail "$subject" <<<"$report" || printf '%s\n' "$report"
+fi
+exit "$rc"

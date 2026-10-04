@@ -112,8 +112,10 @@ above (or `ZK2_SITE`).
 | `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your site |
 | `/etc/zk2/zk2-env` | secrets: borg passphrase, mail credentials | **you**, by hand, mode 600; never in git, never overwritten |
 
-Nightly report on the node, mailed only when there is something to say
-(`ZK2_EMAIL` in `zk2-env`, any of sendmail, msmtp or ssmtp to send it):
+Nightly report on the node, mailed to `ZK2_EMAIL` from `zk2-env` through
+any of sendmail, msmtp or ssmtp. By default it comes every night, "OK" or
+"findings" in the subject, so a missing mail is a signal too;
+`MAIL_WHEN=problems` in `node.conf` limits it to nights with findings.
 
 ```
 # /etc/cron.d/zk2
