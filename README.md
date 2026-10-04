@@ -248,7 +248,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | `bin/` | node tools, installed to `/opt/zk2/bin`: build, new container, publish, backup, restore, health, nightly run |
 | `cloud-init/` | the base profile for new instances |
 | `hooks/` | pre-backup database dumps: PostgreSQL, MariaDB, PostgreSQL in docker, GitLab |
-| `containers/` | nginx front and OpenVPN gateway: configs and helper scripts |
+| `containers/` | nginx front (see containers/nginx/README.md) and OpenVPN gateway: configs and helper scripts |
 | `zabbix/` | optional monitoring: agent installer, templates, dashboard as code |
 | `tools/` | workstation tools: deploy to a node, check all vhosts, OpenVPN client control |
 | `examples/node/` | a fictional node, the template for `zk2-fleet add-node`: `node.conf`, published ports, later backup inventory and restore map |

@@ -1,0 +1,70 @@
+#!/bin/bash
+#
+# Generate an nginx vhost from a template, into your fleet.
+#
+#   conf_generator [-o DIR] DOMAIN proxy  UPSTREAM-URL
+#   conf_generator [-o DIR] DOMAIN static DOCUMENT-ROOT
+#
+#   -o DIR   where to write; default $OUT_DIR. Point it at
+#            nodes/<node>/nginx/conf.d of your fleet.
+#
+# Examples, from your fleet repository:
+#   ../zk2-incus/containers/nginx/conf_generator -o nodes/node1/nginx/conf.d \
+#       app.example.org proxy http://10.20.0.30:8080/
+#   ../zk2-incus/containers/nginx/conf_generator -o nodes/node1/nginx/conf.d \
+#       docs.example.org static /var/www/docs
+#
+# It runs on the workstation and writes into git, not into the front
+# instance: a vhost edited on the instance drifts from git, and the next
+# "zk2-deploy NODE nginx" overwrites it. Refuses to overwrite an existing
+# file.
+#
+# Order: get the certificate FIRST, on the front instance -
+#   certbot certonly --webroot -w /var/www/html/default -d DOMAIN
+# The catch-all default.conf already answers the http-01 challenge on port
+# 80. A vhost deployed before its certificate exists fails "nginx -t".
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+OUT_DIR="${OUT_DIR:-}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '3,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+if [ "${1:-}" = -o ]; then OUT_DIR=${2:?-o needs a directory}; shift 2; fi
+[ $# -eq 3 ] || usage
+[ -n "$OUT_DIR" ] || die "where to? -o nodes/<node>/nginx/conf.d of your fleet (or OUT_DIR)"
+
+domain=$1 kind=$2 target=$3
+
+# A plain hostname only: a stray slash or quote would be spliced straight
+# into an nginx directive.
+[[ $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || die "not a valid domain name: $domain"
+
+case $kind in
+    proxy)
+        template="$SCRIPT_DIR/conf_template_proxy"; placeholder='P_R_O_X_Y_P_A_S_S'
+        [[ $target =~ ^https?://[^[:space:]\|]+$ ]] || die "upstream must be http(s)://... without spaces: $target"
+        ;;
+    static)
+        template="$SCRIPT_DIR/conf_template_static"; placeholder='D_O_C_R_O_O_T'
+        [[ $target =~ ^/[^[:space:]\|]*$ ]] || die "document root must be an absolute path without spaces: $target"
+        ;;
+    *) die "unknown type '$kind', expected 'proxy' or 'static'" ;;
+esac
+
+[ -f "$template" ] || die "template not found: $template"
+[ -d "$OUT_DIR" ] || die "no such directory: $OUT_DIR"
+out="$OUT_DIR/$domain.conf"
+[ -e "$out" ] && die "already exists, refusing to overwrite: $out"
+
+# "|" as the delimiter, so URLs and paths need no escaping ("|" itself is
+# refused above).
+sed -e "s|D_O_M_A_I_N|$domain|g" -e "s|$placeholder|$target|g" "$template" > "$out"
+
+printf 'created %s\n\nnext:\n' "$out"
+printf '  1. certificate, on the front instance (if it is not there yet):\n'
+printf '       certbot certonly --webroot -w /var/www/html/default -d %s\n' "$domain"
+printf '  2. commit, then: zk2-deploy NODE nginx\n'
