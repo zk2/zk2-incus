@@ -115,6 +115,16 @@ do_load() {
     # With the name from the archive taken, incus refuses by itself - rightly:
     # silently replacing a running instance is the worst a restore can do.
     incus import "$TAR" ${newname:+"$newname"} </dev/null || zk2_die "incus import failed"
+    # Under another name it is a copy next to the original, like a restore
+    # probe: the export carries the original's fixed address, and starting
+    # the copy would put two instances on one address - a dnsmasq conflict,
+    # and the copy could take the working service's traffic. The address is
+    # dropped (the copy gets one from the pool) and it does not autostart.
+    if [ -n "$newname" ]; then
+        incus config device unset "$newname" eth0 ipv4.address </dev/null >/dev/null 2>&1 || true
+        incus config set "$newname" boot.autostart=false </dev/null
+        zk2_log "copy: fixed address dropped, boot.autostart=false"
+    fi
     zk2_ok "imported, NOT started"
     zk2_log "start it: incus start ${newname:-<name from the archive>}"
 }
