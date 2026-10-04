@@ -237,6 +237,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-ssh-policy` | node | the ssh policy of node.conf (password login, root login) in existing instances: drop-in or in-place edit, cloud-init stub replaced, verified with sshd -t and sshd -T |
 | `zk2-shell` | node | the zk2 shell setup (history, prompt) in existing instances, and no foreign PS1 overriding it; `--check` only looks |
+| `zk2-export` | node | a one-off snapshot of a whole instance (incus export into borg): save, list, check by importing, load |
 | `zk2-list` | node | table of instances: backup policy, address, memory and disk against their limits, swap, nesting, snapshots, OS; `--deep` adds failed units and services whose executable is missing |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
 

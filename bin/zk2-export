@@ -1,0 +1,142 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# A one-off snapshot of a whole instance: incus export -> borg, and back.
+#
+#   zk2-export save NAME             export the instance into borg
+#   zk2-export list                  list the snapshots made
+#   zk2-export check ARCHIVE         verify by importing, leave nothing behind
+#   zk2-export load ARCHIVE [NAME]   bring the instance back from a snapshot
+#
+# Why apart from zk2-backup, which handles containers and VMs as well: the
+# backup archives FILES. A file, a database, a config come out of it; a
+# bootable VM does not - that needs partitioning, a kernel and a boot loader.
+# incus export takes the INSTANCE: files plus its description - memory,
+# devices, secureboot, the reserved address - and it comes back with one
+# command. So: take a file out -> zk2-backup; bring a machine back as it was
+# -> zk2-export. A snapshot is for a system that does not change, or a point
+# of return before a big change; it is too heavy for daily protection.
+#
+# Names start with "export-", NOT "NAME@": zk2-backup prunes by "NAME@*", and
+# a snapshot named that way would one day be pruned together with the daily
+# archives it was meant to outlive.
+#
+# Temporary space: EXPORT_TMP in node.conf [/var/tmp]. An exported VM is its
+# whole disk, zeros included.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus borg jq
+
+MODE=${1:-}; ARG=${2:-}; ARG2=${3:-}
+case "$MODE" in ""|-h|--help|help) sed -n '4,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+zk2_load_node
+zk2_borg_env
+TMP_BASE=${EXPORT_TMP:-/var/tmp}
+PREFIX=export-
+
+# ONE cleanup, on global variables, set once. A trap inside a function that
+# refers to its local variable runs after the function returned, finds the
+# variable gone, and under set -u cleans nothing. And nothing that sets these
+# may run in a command substitution: an assignment there never reaches this
+# shell, and the subshell does not inherit the EXIT trap either - the
+# extracted image would stay in the temporary directory.
+WORK=""; PROBE=""; TAR=""
+cleanup() {
+    [ -z "$PROBE" ] || incus delete -f "$PROBE" </dev/null >/dev/null 2>&1 || true
+    [ -z "$WORK" ]  || rm -rf "$WORK" || true
+    return 0
+}
+trap cleanup EXIT
+
+do_list() {
+    printf 'Instance snapshots in %s:\n\n' "$BORG_REPO"
+    borg list --glob-archives "${PREFIX}*" --format '{archive:<48} {time}{NL}' 2>/dev/null
+}
+
+do_save() {
+    local name=$1 type need avail archive
+    [ -n "$name" ] || zk2_die "which instance?"
+    zk2_ct_exists "$name" || zk2_die "no instance ${name}"
+    type=$(incus query "/1.0/instances/${name}" </dev/null | jq -r .type)
+    archive="${PREFIX}${name}-$(date +%FT%H%M)"
+
+    # Space for the intermediate tar, checked first: an export dying halfway
+    # leaves a fragment behind.
+    need=$(numfmt --from=auto "$(incus query "/1.0/instances/${name}" </dev/null \
+        | jq -r '.expanded_devices.root.size // "20GiB"' | sed 's/B$//')" 2>/dev/null || echo 0)
+    avail=$(df -B1 --output=avail "$TMP_BASE" 2>/dev/null | tail -1 | tr -d ' ')
+    if [ -n "$avail" ] && [ "$need" -gt 0 ] && [ "$avail" -lt $(( need + 2 * 1024 ** 3 )) ]; then
+        zk2_die "${TMP_BASE} has $(numfmt --to=iec "$avail") free, about $(numfmt --to=iec $(( need + 2 * 1024 ** 3 ))) needed; set EXPORT_TMP"
+    fi
+
+    WORK=$(mktemp -d "${TMP_BASE}/zk2-export.XXXXXX")
+    zk2_log "exporting ${name} (${type})"
+    # --compression none: compression and deduplication are left to borg; a
+    # compressed export differs as a whole every time and barely dedups.
+    # No --optimized-storage: a zfs send stream restores on ZFS only, half
+    # an insurance.
+    incus export "$name" "${WORK}/${name}.tar" --instance-only --compression none </dev/null \
+        || zk2_die "incus export failed"
+    zk2_log "into borg: ${archive}"
+    (cd "$WORK" && borg create --stats --compression zstd "::${archive}" "${name}.tar") \
+        || zk2_die "borg create failed"
+    zk2_ok "done: ${archive}"
+    zk2_log "verify it: zk2-export check ${archive}"
+}
+
+# Extract a whole-instance archive into WORK and set TAR. Called directly,
+# never in $(...), see the cleanup above.
+extract() {
+    local archive=$1
+    borg list --glob-archives "$archive" --format '{archive}{NL}' 2>/dev/null | grep -qxF "$archive" \
+        || zk2_die "no archive ${archive}"
+    # One NAME.tar at the root, checked BEFORE extracting: a file-level
+    # archive would otherwise unpack gigabytes only to show there is no tar.
+    # awk, not grep -q: grep exits on the first match, borg gets SIGPIPE, and
+    # under pipefail the pipe fails although the tar WAS found.
+    borg list "::${archive}" --format '{path}{NL}' 2>/dev/null \
+        | awk '/^[^\/]+\.tar$/ { f = 1 } END { exit !f }' \
+        || zk2_die "${archive} holds no tar - a file archive, not a whole instance"
+    WORK=$(mktemp -d "${TMP_BASE}/zk2-export.XXXXXX")
+    (cd "$WORK" && borg extract "::${archive}") || zk2_die "borg extract failed"
+    TAR=$(find "$WORK" -maxdepth 1 -name '*.tar' | head -1)
+    [ -n "$TAR" ] || zk2_die "no tar after extracting ${archive}"
+}
+
+do_load() {
+    local archive=$1 newname=$2
+    [ -n "$archive" ] || zk2_die "which archive? (zk2-export list)"
+    [ -z "$newname" ] || ! zk2_ct_exists "$newname" || zk2_die "${newname} exists - choose another name"
+    extract "$archive"
+    zk2_log "importing${newname:+ as ${newname}}"
+    # With the name from the archive taken, incus refuses by itself - rightly:
+    # silently replacing a running instance is the worst a restore can do.
+    incus import "$TAR" ${newname:+"$newname"} </dev/null || zk2_die "incus import failed"
+    zk2_ok "imported, NOT started"
+    zk2_log "start it: incus start ${newname:-<name from the archive>}"
+}
+
+# Verify a snapshot by importing it under a temporary name - a backup that
+# was never restored is a hope. Takes minutes and leaves nothing.
+do_check() {
+    local archive=$1
+    [ -n "$archive" ] || zk2_die "which archive? (zk2-export list)"
+    extract "$archive"
+    PROBE="zk2check-$$"
+    incus import "$TAR" "$PROBE" </dev/null || zk2_die "import failed - the archive is unusable"
+    printf '\n== what came out of the archive\n'
+    incus config show "$PROBE" </dev/null | grep -vE '^\s*(volatile|#)' | head -25
+    zk2_ok "${archive} is usable: it imports and assembles into an instance"
+    zk2_log "it was NOT started - this checked restorability, not that it runs"
+}
+
+case "$MODE" in
+    save)  do_save "$ARG" ;;
+    list)  do_list ;;
+    check) do_check "$ARG" ;;
+    load)  do_load "$ARG" "$ARG2" ;;
+    *) zk2_die "unknown mode: ${MODE} (save, list, check or load)" ;;
+esac
