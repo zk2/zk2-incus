@@ -235,6 +235,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | `zk2-archives` | node | what the repository holds, what is stale or missing, how to restore |
 | `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, VPN routes, split DNS, backup inventory, leftover snapshots, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
+| `zk2-ssh-policy` | node | the ssh policy of node.conf (password login, root login) in existing instances: drop-in or in-place edit, cloud-init stub replaced, verified with sshd -t and sshd -T |
 | `zk2-shell` | node | the zk2 shell setup (history, prompt) in existing instances, and no foreign PS1 overriding it; `--check` only looks |
 | `zk2-list` | node | table of instances: backup policy, address, memory and disk against their limits, swap, nesting, snapshots, OS; `--deep` adds failed units and services whose executable is missing |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |

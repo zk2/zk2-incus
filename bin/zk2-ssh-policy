@@ -1,0 +1,213 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR disable=SC2001
+#
+# The ssh policy of the profile base, applied to instances that never got it.
+#
+#   zk2-ssh-policy                 every instance of the node
+#   zk2-ssh-policy NAME [NAME...]  only these
+#   zk2-ssh-policy --check         show the effective policy, change nothing
+#
+# The policy is CT_SSH_PASSWORD [yes] and CT_SSH_ROOT [prohibit-password] in
+# node.conf - the same values zk2-base-profile gives new instances. cloud-init
+# applies them once, on the first start; instances created before a change,
+# restored, or brought in from elsewhere keep whatever sshd config they had.
+# Authorized keys (CT_SSH_KEYS) are not handed out here: rewriting an existing
+# authorized_keys silently is not acceptable.
+#
+# WHERE IT WRITES. Into /etc/ssh/sshd_config.d/60-zk2.conf when the main
+# config has an Include of that directory - the only honest sign that this
+# sshd reads it (OpenSSH learned it in 8.2; older systems would ignore the
+# file silently, the worst kind of failure). Otherwise the main file is
+# edited in place: an existing (or commented) line is changed where it
+# stands, because sshd takes the FIRST value and an appended line would lose.
+#
+# THE cloud-init STUB. If cloud-init's set_passwords ran before
+# openssh-server was installed, sshd_config is a one-line stub without
+# Include, UsePAM or the sftp subsystem, and the package config sits next to
+# it as .ucf-dist or .rpmnew. A stub (nothing but these two keys and
+# comments) is replaced by the package file; anything else was written by a
+# person and is not replaced.
+#
+# CHECKED BY sshd ITSELF. The syntax with sshd -t before the reload, with a
+# rollback on failure; the result with sshd -T after it. Writing a line and
+# having it in effect are different things: when the effective value is not
+# ours, the files setting the same key are listed.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus
+
+CHECK=0; NAMES=()
+for a in "$@"; do
+    case "$a" in
+        --check) CHECK=1 ;;
+        -h|--help) sed -n '4,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) zk2_die "unknown option: $a" ;;
+        *) NAMES+=("$a") ;;
+    esac
+done
+
+zk2_load_node
+PWA=${CT_SSH_PASSWORD:-yes}
+PRL=${CT_SSH_ROOT:-prohibit-password}
+case "$PWA" in yes|no) ;; *) zk2_die "CT_SSH_PASSWORD must be yes or no" ;; esac
+case "$PRL" in yes|prohibit-password|no) ;; *) zk2_die "CT_SSH_ROOT must be yes, prohibit-password or no" ;; esac
+
+# The list is read BEFORE the walk: listing while changing what is listed.
+if [ "${#NAMES[@]}" -eq 0 ]; then
+    mapfile -t NAMES < <(zk2_ct_names)
+fi
+[ "${#NAMES[@]}" -gt 0 ] || zk2_die "no instances on this node"
+
+# One text for both modes, the difference is ZK2_APPLY: the check and the
+# change must look at the same place. Results come back as ZK2:* lines - a
+# failure has more causes than an exit code can name.
+# shellcheck disable=SC2016
+INNER='set -u
+CFG=/etc/ssh/sshd_config
+DROPIN=/etc/ssh/sshd_config.d/60-zk2.conf
+SSHD=$(command -v sshd 2>/dev/null || true)
+[ -n "$SSHD" ] || { [ -x /usr/sbin/sshd ] && SSHD=/usr/sbin/sshd; }
+if [ ! -r "$CFG" ] || [ -z "$SSHD" ]; then echo "ZK2:NOSSHD"; exit 0; fi
+
+effective() {
+    "$SSHD" -T 2>/dev/null | awk '"'"'
+        $1 == "permitrootlogin"        { prl = $2 }
+        $1 == "passwordauthentication" { pwa = $2 }
+        END { if (prl == "without-password") prl = "prohibit-password"
+              printf "%s %s\n", (prl ? prl : "?"), (pwa ? pwa : "?") }'"'"'
+}
+also() {
+    [ -d /etc/ssh/sshd_config.d ] || return 0
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$1" = skip-own ] && [ "$f" = "$DROPIN" ] && continue
+        grep -qiE "^[[:space:]]*(PermitRootLogin|PasswordAuthentication)[[:space:]]" "$f" && echo "ZK2:ALSO ${f}"
+    done
+    return 0
+}
+
+STUB_DIST=
+if ! grep -qE "^[[:space:]]*Include[[:space:]]" "$CFG" \
+   && ! grep -vE "^[[:space:]]*(#|$)" "$CFG" | grep -qviE "^[[:space:]]*(PasswordAuthentication|PermitRootLogin)[[:space:]]"; then
+    for d in "${CFG}.ucf-dist" "${CFG}.rpmnew"; do
+        if [ -f "$d" ] && grep -qE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/" "$d"; then STUB_DIST=$d; break; fi
+    done
+fi
+
+if [ "$ZK2_APPLY" = 0 ]; then
+    echo "ZK2:EFF $(effective)"
+    [ -z "$STUB_DIST" ] || echo "ZK2:STUB ${STUB_DIST}"
+    also all
+    exit 0
+fi
+
+STUB_ROLLBACK=
+if [ -n "$STUB_DIST" ]; then
+    STUB_ROLLBACK=$(mktemp)
+    cp -p "$CFG" "$STUB_ROLLBACK"
+    [ -f "${CFG}.zk2-bak" ] || cp -p "$CFG" "${CFG}.zk2-bak"
+    cp -p "$STUB_DIST" "$CFG"
+    echo "ZK2:UNSTUB ${STUB_DIST}"
+fi
+
+ROLLBACK=$(mktemp)
+if grep -qE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/" "$CFG"; then
+    TARGET=$DROPIN
+    if [ -f "$DROPIN" ]; then cp -p "$DROPIN" "$ROLLBACK"; else : > "$ROLLBACK"; fi
+    mkdir -p /etc/ssh/sshd_config.d
+    printf "# Written by zk2-ssh-policy (CT_SSH_PASSWORD, CT_SSH_ROOT in node.conf);\n# new instances get the same file from the profile base.\nPasswordAuthentication %s\nPermitRootLogin %s\n" \
+        "$ZK2_PWA" "$ZK2_PRL" > "$DROPIN"
+    chmod 600 "$DROPIN"
+else
+    TARGET=$CFG
+    cp -p "$CFG" "$ROLLBACK"
+    # .zk2-bak is "as it was before we first came", written once.
+    [ -f "${CFG}.zk2-bak" ] || cp -p "$CFG" "${CFG}.zk2-bak"
+    for kv in "PermitRootLogin ${ZK2_PRL}" "PasswordAuthentication ${ZK2_PWA}"; do
+        k=${kv%% *}
+        if grep -qE "^[[:space:]]*#?[[:space:]]*${k}([[:space:]]|$)" "$CFG"; then
+            sed -i -E "s|^[[:space:]]*#?[[:space:]]*${k}([[:space:]].*)?$|${kv}|" "$CFG"
+        else
+            printf "%s\n" "$kv" >> "$CFG"
+        fi
+    done
+fi
+
+# Syntax BEFORE the reload: sshd with a broken config does not come up.
+if ! err=$("$SSHD" -t 2>&1); then
+    if [ "$TARGET" = "$DROPIN" ]; then
+        if [ -s "$ROLLBACK" ]; then cp -p "$ROLLBACK" "$DROPIN"; else rm -f "$DROPIN"; fi
+    else
+        cp -p "$ROLLBACK" "$CFG"
+    fi
+    [ -z "$STUB_ROLLBACK" ] || cp -p "$STUB_ROLLBACK" "$CFG"
+    rm -f "$ROLLBACK" ${STUB_ROLLBACK:+"$STUB_ROLLBACK"}
+    echo "ZK2:BADCONF ${err}"
+    exit 0
+fi
+rm -f "$ROLLBACK" ${STUB_ROLLBACK:+"$STUB_ROLLBACK"}
+
+# reload, not restart; the unit is sshd on RHEL, ssh on Debian.
+if   systemctl reload sshd  >/dev/null 2>&1; then :
+elif systemctl reload ssh   >/dev/null 2>&1; then :
+elif systemctl restart sshd >/dev/null 2>&1; then :
+elif systemctl restart ssh  >/dev/null 2>&1; then :
+else echo "ZK2:NORELOAD"; fi
+echo "ZK2:FILE ${TARGET}"
+echo "ZK2:EFF $(effective)"
+also skip-own'
+
+FAIL=0; SKIP=0; DONE=0
+zk2_log "policy: PasswordAuthentication ${PWA}, PermitRootLogin ${PRL}$([ "$CHECK" = 1 ] && echo ' (check only)')"
+for ct in "${NAMES[@]}"; do
+    zk2_ct_exists "$ct" || { zk2_err "${ct}: no such instance"; FAIL=$(( FAIL + 1 )); continue; }
+    # A stopped instance could get the file, but nothing would reload sshd -
+    # and we would leave believing the work was done. Skipped aloud.
+    if ! zk2_ct_running "$ct"; then
+        zk2_warn "${ct}: stopped - skipped, run again after it starts"; SKIP=$(( SKIP + 1 )); continue
+    fi
+    if ! incus exec "$ct" -- true </dev/null >/dev/null 2>&1; then
+        zk2_warn "${ct}: no way in (a VM without its agent?) - fix it from the console"; SKIP=$(( SKIP + 1 )); continue
+    fi
+    # --env, not an assignment in front of incus: that would set it for the
+    # incus client on the node, not for the shell inside.
+    if ! out=$(incus exec "$ct" --env "ZK2_APPLY=$(( 1 - CHECK ))" --env "ZK2_PWA=${PWA}" --env "ZK2_PRL=${PRL}" \
+            -- sh -c "$INNER" </dev/null 2>&1); then
+        zk2_err "${ct}: incus exec failed"; sed 's/^/    /' <<<"$out" >&2; FAIL=$(( FAIL + 1 )); continue
+    fi
+    if grep -q '^ZK2:NOSSHD' <<<"$out"; then
+        zk2_warn "${ct}: no sshd installed - nothing to set"; SKIP=$(( SKIP + 1 )); continue
+    fi
+    bad=$(sed -n 's/^ZK2:BADCONF //p' <<<"$out")
+    if [ -n "$bad" ]; then
+        zk2_err "${ct}: sshd -t refused the config, change rolled back"; sed 's/^/    /' <<<"$bad" >&2
+        FAIL=$(( FAIL + 1 )); continue
+    fi
+    if grep -q '^ZK2:NORELOAD' <<<"$out"; then
+        zk2_warn "${ct}: sshd could not be reloaded - written, but the old config is in effect"
+        FAIL=$(( FAIL + 1 )); continue
+    fi
+    file=$(sed -n 's/^ZK2:FILE //p' <<<"$out")
+    eff=$(sed -n 's/^ZK2:EFF //p' <<<"$out"); prl=${eff%% *}; pwa=${eff##* }
+    stub=$(sed -n 's/^ZK2:STUB //p' <<<"$out")
+    unstub=$(sed -n 's/^ZK2:UNSTUB //p' <<<"$out")
+    [ -z "$unstub" ] || zk2_log "${ct}: sshd_config was a cloud-init stub, ${unstub##*/} put in place (the stub is in sshd_config.zk2-bak)"
+
+    if [ -n "$stub" ]; then
+        zk2_warn "${ct}: sshd_config is a cloud-init stub (no Include, UsePAM, sftp), ${stub##*/} next to it; a run without --check puts it in place"
+        FAIL=$(( FAIL + 1 ))
+    elif [ "$prl" = "$PRL" ] && [ "$pwa" = "$PWA" ]; then
+        zk2_ok "${ct}: root=${prl} password=${pwa}${file:+  (${file})}"; DONE=$(( DONE + 1 ))
+    else
+        if [ "$CHECK" = 1 ]; then zk2_warn "${ct}: root=${prl} password=${pwa}, policy says root=${PRL} password=${PWA}"
+        else zk2_err "${ct}: written, but in effect: root=${prl} password=${pwa}"; fi
+        sed -n 's/^ZK2:ALSO /    the same key is also set in: /p' <<<"$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+zk2_log "done: ${DONE}, skipped: ${SKIP}, with findings: ${FAIL}"
+[ "$SKIP" = 0 ] || zk2_log "skipped instances are not set up"
+[ "$FAIL" = 0 ]
