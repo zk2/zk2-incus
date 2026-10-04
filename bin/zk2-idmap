@@ -28,11 +28,13 @@
 # To switch a container: incus config set NAME security.idmap.isolated=true,
 # then restart it. The root filesystem is remapped on the next start.
 #
-# The second table counts pipe pages per host uid against the soft limit and
-# shows who holds what in the shared root uid. Other uids of the form
-# BASE+N are user N inside non-isolated containers, shared the same way. The
-# pipe size is asked from the kernel (F_GETPIPE_SZ) rather than assumed to be
-# 64 KiB, since some programs grow their pipes.
+# The second table counts pipe pages per host uid against the soft limit.
+# WHO tells whose uid it is, from the containers' uid maps: "web root" or
+# "web uid 101" for an isolated container, "shared uid 33" for user 33 inside
+# any non-isolated one. Below it, the shared root uid is broken down by
+# container. The pipe size is asked from the kernel (F_GETPIPE_SZ) rather than
+# assumed to be 64 KiB, since some programs grow their pipes. Ties are sorted
+# by uid, so two runs can be compared with diff.
 
 # shellcheck source=zk2-lib
 . "$(dirname "$(readlink -f "$0")")/zk2-lib"
@@ -51,6 +53,17 @@ base=$(jq -r '
         | fromjson[] | select(.Isuid and .Nsid == 0) | .Hostid ] | first // empty
 ' <<<"$instances")
 base=${base:-1000000}
+
+# Own ranges of isolated containers, as NAME:HOSTID:SIZE,... for the WHO
+# column. A stopped container has no current map; it holds no pipes either.
+ranges=$(jq -r '
+  [ .[] | select(.type == "container"
+                 and .config["security.idmap.isolated"] == "true")
+        | .name as $n
+        | .config["volatile.idmap.current"] // empty
+        | fromjson[] | select(.Isuid and .Nsid == 0)
+        | "\($n):\(.Hostid):\(.Maprange)" ] | join(",")
+' <<<"$instances")
 
 printf '%-26s %-8s %-5s %-10s %-5s %s\n' INSTANCE STATE ISO BASE NEST ISSUES
 jq -r <<<"$instances" '
@@ -74,7 +87,19 @@ echo
 soft=$(cat /proc/sys/fs/pipe-user-pages-soft)
 perl -e '
 use strict; use Fcntl;
-my ($soft, $base, $pagesize) = @ARGV;
+my ($soft, $base, $pagesize, $ranges) = @ARGV;
+my @ranges = map { [ split /:/ ] } grep { length } split /,/, $ranges;
+sub who {
+    my $uid = shift;
+    for my $r (@ranges) {
+        my ($n, $h, $size) = @$r;
+        next unless $uid >= $h && $uid < $h + $size;
+        my $in = $uid - $h;
+        return $in == 0 ? "$n root" : "$n uid $in";
+    }
+    my $in = $uid - $base;
+    return $in == 0 ? "shared root" : "shared uid $in";
+}
 my (%seen, %uid_pages, %ct_pages, %ct_n);
 opendir(my $d, "/proc") or die;
 for my $pid (grep { /^\d+$/ } readdir $d) {
@@ -104,16 +129,17 @@ for my $pid (grep { /^\d+$/ } readdir $d) {
         $ct_n{"$uid $ct"}++;
     }
 }
-printf "%-10s %8s  %s\n", "UID", "PAGES", "OF fs.pipe-user-pages-soft = $soft";
-for my $u (sort { $uid_pages{$b} <=> $uid_pages{$a} } keys %uid_pages) {
+print "fs.pipe-user-pages-soft = $soft pages per uid\n";
+printf "%-10s %8s  %s\n", "UID", "PAGES", "WHO";
+for my $u (sort { $uid_pages{$b} <=> $uid_pages{$a} || $a <=> $b } keys %uid_pages) {
     my $mark = $uid_pages{$u} > $soft ? "  OVER: new pipes get 8 KiB" : "";
-    printf "%-10s %8d%s\n", $u, $uid_pages{$u}, $mark;
+    printf "%-10s %8d  %s%s\n", $u, $uid_pages{$u}, who($u), $mark;
 }
 print "\nshared root uid $base by instance:\n";
-my @k = sort { $ct_pages{$b} <=> $ct_pages{$a} } grep { /^$base / } keys %ct_pages;
+my @k = sort { $ct_pages{$b} <=> $ct_pages{$a} || $a cmp $b } grep { /^$base / } keys %ct_pages;
 print "  no pipes\n" unless @k;
 for my $k (@k) {
     (my $ct = $k) =~ s/^\d+ //;
     printf "  %8d pages %5d pipes  %s\n", $ct_pages{$k}, $ct_n{$k}, $ct;
 }
-' "$soft" "$base" "$(getconf PAGESIZE)"
+' "$soft" "$base" "$(getconf PAGESIZE)" "$ranges"
