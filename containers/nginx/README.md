@@ -28,13 +28,15 @@ and ships stream separately; with it, change `user` and add
 ```sh
 zk2-new-ct                                # name nginx, debian/13/cloud, an address in CT_NET
 incus exec nginx -- sh -c '
+  export DEBIAN_FRONTEND=noninteractive
   apt-get install -y curl gnupg ca-certificates certbot
   curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx.gpg
   echo "deb [signed-by=/usr/share/keyrings/nginx.gpg] https://nginx.org/packages/debian trixie nginx" \
       > /etc/apt/sources.list.d/nginx.list
   apt-get update && apt-get install -y nginx
   mkdir -p /var/www/html/default
-  rm -f /etc/nginx/conf.d/default.conf'    # the package's example server
+  rm -f /etc/nginx/conf.d/default.conf     # the package example server
+  systemctl enable nginx'                  # the package neither starts nor enables it
 ```
 
 Then on the workstation: `cp -r ../zk2-incus/examples/node/nginx nodes/NODE/`,
