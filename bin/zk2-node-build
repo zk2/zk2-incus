@@ -81,6 +81,16 @@ disk_in_our_pool() {
     return 1
 }
 
+# Secure Boot state from the EFI variable: 4 bytes of attributes, then the
+# value. No EFI or no variable means legacy boot - off.
+secure_boot_state() {
+    local f v
+    f=$(find /sys/firmware/efi/efivars -maxdepth 1 -name "SecureBoot-*" 2>/dev/null | head -1)
+    [ -n "$f" ] || { echo off; return; }
+    v=$(od -An -t u1 -j4 -N1 "$f" 2>/dev/null | tr -d ' ')
+    [ "$v" = 1 ] && echo on || echo off
+}
+
 step_checks() {
     zk2_log "== checks"
     zk2_require_root
@@ -94,6 +104,21 @@ step_checks() {
     fi
     [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] || zk2_die "cgroup v2 is not mounted"
     zk2_ok "kernel $(uname -r), cgroup v2"
+
+    # Secure Boot, checked before anything is installed. dkms signs the ZFS
+    # module with a key (MOK) it generates itself; firmware that does not
+    # know that key makes the kernel refuse the module ("Key was rejected by
+    # service") - after every package is already in place, and with nothing
+    # in the message pointing at the cause. Incus VMs have Secure Boot on by
+    # default; so does some hardware.
+    if [ "$(secure_boot_state)" = on ]; then
+        zk2_err "Secure Boot is ON: the kernel will refuse the dkms-built ZFS module"
+        zk2_err "  either turn Secure Boot off in the firmware (for an Incus VM:"
+        zk2_err "    incus config set NAME security.secureboot=false && incus restart NAME)"
+        zk2_err "  or, after a run that installed zfs-dkms, enroll its key and confirm on the console:"
+        zk2_err "    mokutil --import /var/lib/dkms/mok.pub && reboot"
+        [ "$FORCE" = 1 ] || zk2_die "stopping before any change; --force goes on regardless"
+    fi
 
     for d in $ZFS_DISKS; do
         [ -b "$d" ] || zk2_die "not a block device: ${d}"
@@ -215,7 +240,11 @@ step_zfs() {
                 zk2_warn "  ${k}: no ZFS module (older fallback kernel): apt-get install -y linux-headers-${k} && dkms autoinstall -k ${k}"
             fi
         done < <(find /lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V)
-        modprobe zfs || zk2_die "the ZFS module does not load"
+        if ! modprobe zfs; then
+            [ "$(secure_boot_state)" = off ] \
+                || zk2_err "Secure Boot is on - see above: enroll /var/lib/dkms/mok.pub or turn it off"
+            zk2_die "the ZFS module does not load"
+        fi
         zk2_ok "ZFS $(cat /sys/module/zfs/version 2>/dev/null || echo '?')"
     fi
 
