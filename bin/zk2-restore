@@ -11,11 +11,19 @@
 #                                        the same under another name, to look
 #                                        at an old copy WITHOUT touching the
 #                                        working instance
+#   zk2-restore stdin NAME               the same, but the root arrives as a tar
+#                                        stream on stdin instead of from this
+#                                        node's borg - how zk2-send on a peer
+#                                        node delivers an instance from ITS
+#                                        repository; the address comes from
+#                                        THIS node's map
 #
 #   --config FILE   give instances back their configuration (limits, swap,
 #                   autostart, root size) from Incus JSON: instances.json from
 #                   the host backup (zk2-host-backup) or the output of
 #                   "incus query /1.0/instances/NAME"
+#   --config-b64 S  the same as one base64 string (zk2-send passes the
+#                   configuration through ssh this way)
 #   --force         replace an instance that exists
 #   --dry-run       show what would be done
 #
@@ -44,7 +52,7 @@
 zk2_require_root
 zk2_require_cmd incus jq
 
-DRY_RUN=0; FORCE=0; ARCHIVE_SET=""; AS_NAME=""; CONF_FILE=""
+DRY_RUN=0; FORCE=0; ARCHIVE_SET=""; AS_NAME=""; CONF_FILE=""; CONF_B64=""
 
 # Options are parsed over the WHOLE command line, not up to the first word.
 # Stopping at "one" would silently drop "--archive A --as PROBE" from the
@@ -58,7 +66,8 @@ while [ $# -gt 0 ]; do
         --archive) ARCHIVE_SET=${2:?--archive needs an archive name}; shift 2 ;;
         --as)      AS_NAME=${2:?--as needs an instance name}; shift 2 ;;
         --config)  CONF_FILE=${2:?--config needs a JSON file}; shift 2 ;;
-        -h|--help) sed -n '4,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --config-b64) CONF_B64=${2:?--config-b64 needs a string}; shift 2 ;;
+        -h|--help) sed -n '4,48p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) zk2_die "unknown option: $1" ;;
         *) POSITIONAL+=("$1"); shift ;;
     esac
@@ -71,11 +80,23 @@ zk2_load_node
 MAP=${ZK2_RESTORE_MAP:-${ZK2_CONF_DIR}/restore.conf}
 DEFAULT_IMAGE=${RESTORE_IMAGE:-images:debian/13}
 [ -r "$MAP" ] || zk2_die "no restore map ${MAP}"
-[ -z "$CONF_FILE" ] || [ -r "$CONF_FILE" ] || zk2_die "cannot read ${CONF_FILE}"
-if [ "$MODE" != list ]; then
-    zk2_require_cmd borg
-    zk2_borg_env
+# The base64 configuration goes into a temporary file: from there on one path
+# serves both --config and --config-b64.
+if [ -n "$CONF_B64" ]; then
+    [ -z "$CONF_FILE" ] || zk2_die "--config and --config-b64 together make no sense"
+    CONF_FILE=$(mktemp)
+    trap 'rm -f "$CONF_FILE"' EXIT
+    base64 -d <<<"$CONF_B64" > "$CONF_FILE" 2>/dev/null || zk2_die "--config-b64 does not decode"
 fi
+[ -z "$CONF_FILE" ] || [ -r "$CONF_FILE" ] || zk2_die "cannot read ${CONF_FILE}"
+# stdin needs no borg: the sending node reads its own repository.
+case "$MODE" in
+    list|stdin) ;;
+    *) zk2_require_cmd borg; zk2_borg_env ;;
+esac
+
+# Where the root comes from: this node's borg, or a tar stream (stdin mode).
+SOURCE=borg
 
 map_rows() { grep -vE '^[[:space:]]*(#|$)' "$MAP"; }
 
@@ -118,7 +139,9 @@ restore_one() {
 
     # The archive is resolved BEFORE anything is created: a typo must not
     # leave an empty instance behind.
-    if [ -n "$ARCHIVE_SET" ]; then
+    if [ "$SOURCE" = stdin ]; then
+        archive="(tar stream on stdin)"
+    elif [ -n "$ARCHIVE_SET" ]; then
         archive=$ARCHIVE_SET
         borg list --glob-archives "$archive" --format '{archive}{NL}' 2>/dev/null | grep -qxF "$archive" \
             || { zk2_err "  no archive ${archive} (see zk2-archives ${name})"; return 1; }
@@ -132,14 +155,16 @@ restore_one() {
 
     # What kind of archive: a whole VM export holds exactly one NAME.tar.
     # head closes the pipe early; borg's SIGPIPE must not end the script.
-    files=$(borg list --format '{path}{NL}' "::${archive}" 2>/dev/null | head -3 || true)
-    if [ "$(grep -c . <<<"$files")" = 1 ] && [[ "$files" == *.tar ]]; then
-        restore_vm_export "$target" "$archive" "$files" "$addr"
-        return
+    if [ "$SOURCE" = borg ]; then
+        files=$(borg list --format '{path}{NL}' "::${archive}" 2>/dev/null | head -3 || true)
+        if [ "$(grep -c . <<<"$files")" = 1 ] && [[ "$files" == *.tar ]]; then
+            restore_vm_export "$target" "$archive" "$files" "$addr"
+            return
+        fi
     fi
 
     if [ "$DRY_RUN" = 1 ]; then
-        zk2_log "  incus create ${image} ${target}; empty its root; borg extract --numeric-ids"
+        zk2_log "  incus create ${image} ${target}; empty its root; $([ "$SOURCE" = stdin ] && echo "tar -x from stdin" || echo "borg extract --numeric-ids")"
         if [ -n "$CONF_FILE" ]; then zk2_log "  configuration from ${CONF_FILE}"
         else zk2_warn "  configuration NOT restored: without --config there are no limits"; fi
         if [ -n "$AS_NAME" ]; then zk2_log "  no address (probe), start"
@@ -177,7 +202,17 @@ restore_one() {
 
     # --numeric-ids, no shifting: Incus maps ids on the fly (idmapped mounts),
     # files on disk keep uid 0.
-    if ! (cd "${base}/rootfs" && borg extract --numeric-ids "::${archive}"); then
+    #
+    # A tar stream comes from zk2-send, which extracted the archive with borg
+    # and sends it with xattrs and ACLs. The same switches here: without
+    # --xattrs-include='*' GNU tar restores user.* only, and file
+    # capabilities (security.capability) would be lost silently.
+    if [ "$SOURCE" = stdin ]; then
+        if ! tar -x -f - -C "${base}/rootfs" --numeric-owner --same-permissions \
+                 --xattrs --xattrs-include='*' --acls; then
+            unmount_ours; zk2_err "  tar from stdin failed"; return 1
+        fi
+    elif ! (cd "${base}/rootfs" && borg extract --numeric-ids "::${archive}"); then
         unmount_ours; zk2_err "  borg extract failed"; return 1
     fi
 
@@ -297,10 +332,20 @@ do_one() {
     [ "$found" = 1 ] || zk2_die "${want} is not in ${MAP}"
 }
 
+# Receiving from zk2-send. No --archive: the sender chooses the archive. The
+# stream on stdin is read by exactly one restore_one - do_one guarantees it,
+# the map is read through fd 3.
+do_stdin() {
+    [ -z "$ARCHIVE_SET" ] || zk2_die "--archive does not apply to stdin: the sender chooses the archive"
+    SOURCE=stdin
+    do_one "$1"
+}
+
 [ "$DRY_RUN" = 0 ] || zk2_warn "DRY RUN: nothing is changed"
 case "$MODE" in
     list) do_list ;;
     wave) [ -n "$ARG" ] || zk2_die "which wave?"; do_wave "$ARG" ;;
     one)  [ -n "$ARG" ] || zk2_die "which instance?"; do_one "$ARG" ;;
-    *) zk2_die "unknown mode: ${MODE} (list, wave or one)" ;;
+    stdin) [ -n "$ARG" ] || zk2_die "which instance?"; do_stdin "$ARG" ;;
+    *) zk2_die "unknown mode: ${MODE} (list, wave, one or stdin)" ;;
 esac
