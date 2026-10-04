@@ -196,7 +196,11 @@ attach_wanted() {
 
 do_attach() {
     say "== ACL attachments"
-    [ -r "$ATTACH_FILE" ] || warn "  no ${ATTACH_FILE}"
+    # No attachment file is a normal state when there are no ACLs; with ACLs
+    # described it means none of them protects anything.
+    if [ ! -r "$ATTACH_FILE" ] && [ -n "$(acl_files)" ]; then
+        warn "  no ${ATTACH_FILE}: the ACLs above are attached to nothing"
+    fi
 
     local ct dev acls live_acls live_egress
     while read -r ct dev acls; do
