@@ -1,0 +1,307 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Restore instances from borg, driven by the restore map.
+#
+#   zk2-restore list                     what the map describes
+#   zk2-restore wave N                   restore a whole wave
+#   zk2-restore one NAME                 restore one instance, newest archive
+#   zk2-restore one NAME --archive A     a given archive instead of the newest
+#   zk2-restore one NAME --archive A --as PROBE
+#                                        the same under another name, to look
+#                                        at an old copy WITHOUT touching the
+#                                        working instance
+#
+#   --config FILE   give instances back their configuration (limits, swap,
+#                   autostart, root size) from Incus JSON: instances.json from
+#                   the host backup (zk2-host-backup) or the output of
+#                   "incus query /1.0/instances/NAME"
+#   --force         replace an instance that exists
+#   --dry-run       show what would be done
+#
+# The archive carries the root file system. Limits and the rest live in the
+# Incus database: without --config an instance comes up with the memory of
+# the whole node and a root the size of the pool.
+#
+# The map is /etc/zk2/restore.conf (from your fleet):
+#
+#   archive-prefix  name  address  wave  [image]
+#
+# A prefix, not an archive name: names carry a timestamp, and the newest
+# archive with the prefix is taken. Waves give the order on the day of a
+# disaster: front first, then VPN, then the rest.
+#
+# A container is created from the image (RESTORE_IMAGE in node.conf, or the
+# map row), its root is emptied and the archive extracted into it. A VM
+# archived whole (monthly policy: the archive holds one NAME.tar) comes back
+# with incus import. A file-level VM archive cannot boot - it has no kernel
+# and no boot loader - and is refused; take files from it with borg mount.
+#
+# Archives and their dates: zk2-archives NAME.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus jq
+
+DRY_RUN=0; FORCE=0; ARCHIVE_SET=""; AS_NAME=""; CONF_FILE=""
+
+# Options are parsed over the WHOLE command line, not up to the first word.
+# Stopping at "one" would silently drop "--archive A --as PROBE" from the
+# documented form - and with --force, "bring up a copy under another name"
+# would become "replace the working instance with the newest archive".
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --force)   FORCE=1; shift ;;
+        --archive) ARCHIVE_SET=${2:?--archive needs an archive name}; shift 2 ;;
+        --as)      AS_NAME=${2:?--as needs an instance name}; shift 2 ;;
+        --config)  CONF_FILE=${2:?--config needs a JSON file}; shift 2 ;;
+        -h|--help) sed -n '4,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) zk2_die "unknown option: $1" ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+MODE=${1:-list}
+ARG=${2:-}
+
+zk2_load_node
+MAP=${ZK2_RESTORE_MAP:-${ZK2_CONF_DIR}/restore.conf}
+DEFAULT_IMAGE=${RESTORE_IMAGE:-images:debian/13}
+[ -r "$MAP" ] || zk2_die "no restore map ${MAP}"
+[ -z "$CONF_FILE" ] || [ -r "$CONF_FILE" ] || zk2_die "cannot read ${CONF_FILE}"
+if [ "$MODE" != list ]; then
+    zk2_require_cmd borg
+    zk2_borg_env
+fi
+
+map_rows() { grep -vE '^[[:space:]]*(#|$)' "$MAP"; }
+
+do_list() {
+    printf '%-20s %-20s %-16s %-5s %s\n' PREFIX NAME ADDRESS WAVE IMAGE
+    while read -r prefix name addr wave image _; do
+        printf '%-20s %-20s %-16s %-5s %s\n' "$prefix" "$name" "$addr" "$wave" "${image:-$DEFAULT_IMAGE}"
+    done < <(map_rows)
+}
+
+# --------------------------------------------------------------------------
+# One instance
+# --------------------------------------------------------------------------
+#
+# Every incus call here has </dev/null, and the map is read through fd 3 in
+# the callers - two independent guards. "incus create" reads instance config
+# from stdin; fed the rest of the map, it failed with "cannot construct
+# !!str ... into api.InstancePut" and a wave of twelve ended after one.
+
+restore_one() {
+    local prefix=$1 name=$2 addr=$3 image=${4:-$DEFAULT_IMAGE} t0 target archive files
+    t0=$(date +%s)
+
+    # Under another name the address is NOT assigned: two instances with one
+    # ipv4.address conflict in dnsmasq, and worse, the probe could take over
+    # the traffic of the working service. The probe gets one from the pool.
+    target=${AS_NAME:-$name}
+    if [ -n "$AS_NAME" ]; then
+        zk2_warn "== ${name} -> ${target}: probe, address ${addr} NOT assigned"
+    else
+        zk2_log "== ${name} (${addr})"
+    fi
+
+    # An existing instance is never replaced silently.
+    if zk2_ct_exists "$target"; then
+        [ "$FORCE" = 1 ] || { zk2_warn "  ${target} exists - skipped (--force replaces it)"; return 0; }
+        zk2_warn "  ${target} exists, --force: deleting it"
+        [ "$DRY_RUN" = 1 ] || incus delete -f "$target" </dev/null
+    fi
+
+    # The archive is resolved BEFORE anything is created: a typo must not
+    # leave an empty instance behind.
+    if [ -n "$ARCHIVE_SET" ]; then
+        archive=$ARCHIVE_SET
+        borg list --glob-archives "$archive" --format '{archive}{NL}' 2>/dev/null | grep -qxF "$archive" \
+            || { zk2_err "  no archive ${archive} (see zk2-archives ${name})"; return 1; }
+    else
+        # --glob-archives, not --prefix: the latter is deprecated in borg 1.4
+        # and gone in borg 2, and the whole map rests on this lookup.
+        archive=$(borg list --glob-archives "${prefix}*" --last 1 --format '{archive}' 2>/dev/null || true)
+        [ -n "$archive" ] || { zk2_err "  no archive with prefix ${prefix}"; return 1; }
+    fi
+    zk2_log "  archive: ${archive}"
+
+    # What kind of archive: a whole VM export holds exactly one NAME.tar.
+    # head closes the pipe early; borg's SIGPIPE must not end the script.
+    files=$(borg list --format '{path}{NL}' "::${archive}" 2>/dev/null | head -3 || true)
+    if [ "$(grep -c . <<<"$files")" = 1 ] && [[ "$files" == *.tar ]]; then
+        restore_vm_export "$target" "$archive" "$files" "$addr"
+        return
+    fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+        zk2_log "  incus create ${image} ${target}; empty its root; borg extract --numeric-ids"
+        if [ -n "$CONF_FILE" ]; then zk2_log "  configuration from ${CONF_FILE}"
+        else zk2_warn "  configuration NOT restored: without --config there are no limits"; fi
+        if [ -n "$AS_NAME" ]; then zk2_log "  no address (probe), start"
+        else zk2_log "  ipv4.address=${addr}, start"; fi
+        return 0
+    fi
+
+    incus create "$image" "$target" </dev/null >/dev/null
+
+    # A file-level VM archive: refuse before anything is extracted.
+    if [ "$(incus query "/1.0/instances/${target}" </dev/null | jq -r .type)" != container ]; then
+        incus delete -f "$target" </dev/null
+        zk2_err "  ${image} is not a container image"
+        return 1
+    fi
+
+    # On ZFS the dataset of a STOPPED container is not mounted (Incus mounts
+    # it on start), so there is no rootfs directory. Mount it ourselves and
+    # always unmount, or Incus cannot start the container on top of it.
+    local storage pool root base mounted=0
+    storage=$(zk2_storage "$target") || { zk2_err "  ${storage}"; return 1; }
+    pool=${storage%% *}; root=${storage#* }
+    base="${ZK2_INCUS_DIR:-/var/lib/incus}/storage-pools/${pool}/containers/${target}"
+    if [ ! -d "${base}/rootfs" ]; then
+        mkdir -p "$base"
+        mount -t zfs "${root}/containers/${target}" "$base" 2>/dev/null \
+            || { zk2_err "  no ${base}/rootfs and the dataset does not mount"; return 1; }
+        mounted=1
+    fi
+    unmount_ours() { [ "$mounted" = 1 ] && umount "$base" 2>/dev/null; return 0; }
+
+    # The base image is wiped completely: files of the image that are not in
+    # the archive must not live on in a restored instance.
+    find "${base}/rootfs" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+    # --numeric-ids, no shifting: Incus maps ids on the fly (idmapped mounts),
+    # files on disk keep uid 0.
+    if ! (cd "${base}/rootfs" && borg extract --numeric-ids "::${archive}"); then
+        unmount_ours; zk2_err "  borg extract failed"; return 1
+    fi
+
+    # Docker inside needs security.nesting: without it dockerd starts but
+    # none of its containers does ("open sysctl
+    # net.ipv4.ip_unprivileged_port_start: permission denied"). Looked up in
+    # the extracted root while it is mounted; nesting is not turned on where
+    # nothing needs it.
+    local has_docker=0
+    [ -e "${base}/rootfs/usr/bin/dockerd" ] && has_docker=1
+    unmount_ours
+
+    # Source configuration BEFORE the first start: limits apply at once,
+    # security.* and raw.* on the next start, which this one is. Then docker:
+    # if the archive has docker and the old config said nesting=false, the
+    # docker found wins, or its containers never come up.
+    if [ -n "$CONF_FILE" ]; then
+        zk2_ct_config_apply "$target" "$CONF_FILE" "$name" || true
+        # A probe must not come up by itself after a node reboot: its services
+        # would start a second time next to the working ones.
+        [ -z "$AS_NAME" ] || incus config set "$target" boot.autostart=false </dev/null
+    else
+        zk2_warn "  no --config: ${target} has no limits and no root size"
+    fi
+    [ "$has_docker" = 0 ] || { incus config set "$target" security.nesting=true </dev/null; zk2_ok "  docker inside - security.nesting on"; }
+
+    [ -n "$AS_NAME" ] || incus config device override "$target" eth0 ipv4.address="$addr" </dev/null >/dev/null
+    incus start "$target" </dev/null
+    zk2_ct_wait_systemd "$target" || zk2_warn "  systemd did not report ready within 60 s"
+    check_after_start "$target" "$addr"
+    zk2_ok "  ${target} restored in $(( $(date +%s) - t0 )) s"
+}
+
+# A whole VM from a monthly archive: the tar goes back through incus import.
+restore_vm_export() {
+    local target=$1 archive=$2 tar=$3 addr=$4 tmp need avail
+    tmp=${EXPORT_TMP:-/var/tmp}
+    if [ "$DRY_RUN" = 1 ]; then
+        zk2_log "  whole VM: borg extract ${tar} into ${tmp}, incus import as ${target}"
+        return 0
+    fi
+    need=$(borg list --format '{size}' "::${archive}" "$tar" 2>/dev/null || echo 0)
+    avail=$(df -B1 --output=avail "$tmp" 2>/dev/null | tail -1 | tr -d ' ')
+    if [ -n "$avail" ] && [ "${need:-0}" -gt "$avail" ]; then
+        zk2_err "  ${tmp} has $(numfmt --to=iec "$avail") free, the export needs $(numfmt --to=iec "$need")"
+        return 1
+    fi
+    tmp=$(mktemp -d "${tmp}/zk2-import.XXXXXX")
+    if ! (cd "$tmp" && borg extract "::${archive}" "$tar"); then
+        rm -rf "$tmp"; zk2_err "  borg extract failed"; return 1
+    fi
+    if ! incus import "${tmp}/${tar}" "$target" </dev/null; then
+        rm -rf "$tmp"; zk2_err "  incus import failed"; return 1
+    fi
+    rm -rf "$tmp"
+    # An export carries the configuration of the instance, address included.
+    # A probe must neither take the address nor start by itself.
+    if [ -n "$AS_NAME" ]; then
+        incus config device override "$target" eth0 ipv4.address= </dev/null >/dev/null 2>&1 \
+            || incus config device unset "$target" eth0 ipv4.address </dev/null >/dev/null 2>&1 || true
+        incus config set "$target" boot.autostart=false </dev/null
+    fi
+    zk2_ok "  ${target} imported (whole VM); start it with: incus start ${target}"
+}
+
+# What a restored instance looks like right after start. Reported, not
+# fixed: each of these needs a decision.
+check_after_start() {
+    local ct=$1 want=$2 ip4 failed down
+    ip4=$(incus exec "$ct" -- sh -c "ip -4 -o addr show eth0 2>/dev/null | awk '{ print \$4 }'" </dev/null 2>/dev/null || true)
+    case "$ip4" in
+        "") zk2_warn "  NO address on eth0 - up, but unreachable" ;;
+        "${want}/"*) zk2_ok "  address ${ip4} on eth0" ;;
+        *) if [ -n "$AS_NAME" ]; then zk2_ok "  address ${ip4} on eth0 (probe, from the pool)"
+           else zk2_warn "  eth0 has ${ip4}, expected ${want}"; fi ;;
+    esac
+
+    failed=$(incus exec "$ct" -- systemctl --failed --no-legend --plain </dev/null 2>/dev/null || true)
+    # shellcheck disable=SC2001
+    [ -z "$failed" ] || { zk2_warn "  failed units:"; sed 's/^/    /' <<<"$failed" >&2; }
+
+    # Containers with a restart policy need a few seconds after dockerd.
+    if incus exec "$ct" -- sh -c 'command -v docker' </dev/null >/dev/null 2>&1; then
+        sleep 15
+        down=$(incus exec "$ct" -- sh -c 'docker ps -a --filter status=exited --filter status=created \
+            --filter status=restarting -q | xargs -r docker inspect -f "{{.Name}} {{.State.Status}} restart={{.HostConfig.RestartPolicy.Name}}"' \
+            </dev/null 2>/dev/null || true)
+        # shellcheck disable=SC2001
+        [ -z "$down" ] || { zk2_warn "  docker containers NOT running:"; sed 's|^/||; s/^/    /' <<<"$down" >&2; }
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+
+do_wave() {
+    local want=$1 n=0 bad=0
+    # An explicit archive or name only makes sense for one instance.
+    [ -z "$ARCHIVE_SET" ] || zk2_die "--archive only works with one"
+    [ -z "$AS_NAME" ]     || zk2_die "--as only works with one"
+    while read -r prefix name addr wave image _ <&3; do
+        [ "$wave" = "$want" ] || continue
+        restore_one "$prefix" "$name" "$addr" "${image:-}" || { zk2_err "${name}: FAILED"; bad=$(( bad + 1 )); }
+        n=$(( n + 1 ))
+    done 3< <(map_rows)
+    [ "$n" -gt 0 ] || zk2_die "wave ${want} is empty"
+    zk2_ok "wave ${want}: ${n} instances, ${bad} failed"
+    [ "$bad" = 0 ]
+}
+
+do_one() {
+    local want=$1 found=0
+    while read -r prefix name addr wave image _ <&3; do
+        [ "$name" = "$want" ] || continue
+        found=1
+        restore_one "$prefix" "$name" "$addr" "${image:-}"
+    done 3< <(map_rows)
+    [ "$found" = 1 ] || zk2_die "${want} is not in ${MAP}"
+}
+
+[ "$DRY_RUN" = 0 ] || zk2_warn "DRY RUN: nothing is changed"
+case "$MODE" in
+    list) do_list ;;
+    wave) [ -n "$ARG" ] || zk2_die "which wave?"; do_wave "$ARG" ;;
+    one)  [ -n "$ARG" ] || zk2_die "which instance?"; do_one "$ARG" ;;
+    *) zk2_die "unknown mode: ${MODE} (list, wave or one)" ;;
+esac

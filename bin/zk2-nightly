@@ -1,0 +1,93 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# The nightly run: back up instances, back up the host, check health - and
+# ONE report.
+#
+# Usage: zk2-nightly [--no-mail]
+#
+#   # /etc/cron.d/zk2
+#   0 3 * * * root /usr/local/sbin/zk2-nightly
+#
+# Why a wrapper when every step can mail on its own: ORDER, not one mail
+# instead of three. zk2-health reports any zk2-* snapshot as left over, with
+# no age on purpose; run it while a backup works and the backup's working
+# snapshot shows up as "left by a failed run". Spreading cron lines an hour
+# apart makes that false alarm rare, not gone - backup time grows with the
+# data and one night outgrows any gap. Here the steps run strictly one after
+# another.
+#
+# One failing step does not cancel the others: if the backup failed, knowing
+# the state of the pool matters all the more.
+#
+# When the report is mailed - MAIL_WHEN in node.conf:
+#   always    every night, "ok" or "FAILED" in the subject (default: a missing
+#             mail is then a signal as well)
+#   problems  only when a step failed or health has findings. Silence then
+#             also looks like "did not run at all"; only choose it if
+#             something else watches that the node is alive.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+
+NO_MAIL=0
+case "${1:-}" in
+    --no-mail) NO_MAIL=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+zk2_load_node
+zk2_try_env
+NODE_NAME=${NODE_NAME:-$(hostname -s)}
+MAIL_WHEN=${MAIL_WHEN:-always}
+HERE=$(dirname "$(readlink -f "$0")")
+
+BODY=""; FAILED=""
+
+# run TITLE TAG COMMAND... - the step's whole output, stderr included, goes
+# into the report. "|| rc=$?" is required: under set -e a failing step would
+# end the wrapper halfway, which is exactly what it exists to prevent.
+run() {
+    local title=$1 tag=$2 out rc=0
+    shift 2
+    out=$("$@" 2>&1) || rc=$?
+    BODY+=$'\n'"=== ${title}"$'\n\n'"${out}"$'\n'
+    [ "$rc" = 0 ] || FAILED+="${tag} "
+    return 0
+}
+
+STARTED=$(date '+%F %T')
+run "BACKUP" backup "${HERE}/zk2-backup"
+# The host is its own step, not part of zk2-backup: one failing must not
+# cancel the other. Before health, for the same reason as the backup.
+run "HOST"   host   "${HERE}/zk2-host-backup"
+run "HEALTH" health "${HERE}/zk2-health"
+
+case "$MAIL_WHEN" in
+    always|problems) ;;
+    # A typo must not switch the mail off quietly.
+    *) BODY+=$'\n'"node.conf: MAIL_WHEN='${MAIL_WHEN}' not understood (always or problems), mailing as with always"$'\n'
+       MAIL_WHEN=always ;;
+esac
+
+if [ -n "$FAILED" ]; then
+    SUBJECT="${NODE_NAME}: nightly FAILED (${FAILED% })"
+    TOP="PROBLEMS IN: ${FAILED% }"
+else
+    SUBJECT="${NODE_NAME}: nightly ok"
+    TOP="All steps passed"
+fi
+REPORT=$(printf 'Nightly run on %s: %s - %s\n%s\n%s\nzk2 %s\n' \
+    "$NODE_NAME" "$STARTED" "$(date '+%F %T')" "$TOP" "$BODY" "$(zk2_version)")
+
+if [ "$NO_MAIL" = 1 ]; then
+    printf '%s\n' "$REPORT"
+elif [ -n "$FAILED" ] || [ "$MAIL_WHEN" = always ]; then
+    # Nothing to send with, or sending failed: print the report. Silence here
+    # looks exactly like "all is well" - the worst outcome of all.
+    zk2_mail "$SUBJECT" <<<"$REPORT" || printf '%s\n' "$REPORT"
+fi
+[ -z "$FAILED" ]

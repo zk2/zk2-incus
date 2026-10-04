@@ -115,3 +115,91 @@ zk2_ct_exists()  { incus info "$1" </dev/null >/dev/null 2>&1; }
 # Status from "incus info", not "incus list": list takes a name PREFIX, so
 # "incus list web" also returns web-db, and three lines are not one state.
 zk2_ct_running() { [ "$(incus info "$1" </dev/null 2>/dev/null | awk '/^Status:/ { print $2; exit }')" = RUNNING ]; }
+
+# zk2_storage NAME - print "POOL DATASET_ROOT" of an instance, or a reason and
+# return 1.
+#
+# Asked from Incus, not assembled from a pool name in config: the instance's
+# root device names the storage pool, the pool's zfs.pool_name names the ZFS
+# dataset Incus keeps it under ("tank", "tank/incus", ...). Anything but the
+# zfs driver is refused by name. Default project only.
+zk2_storage() {
+    local pool driver root
+    pool=$(incus query "/1.0/instances/$1" </dev/null 2>/dev/null | jq -r '.expanded_devices.root.pool // empty')
+    [ -n "$pool" ] || { echo "no root disk pool"; return 1; }
+    read -r driver root < <(incus query "/1.0/storage-pools/${pool}" </dev/null 2>/dev/null \
+        | jq -r '[.driver, (.config["zfs.pool_name"] // .name)] | @tsv' | tr '\t' ' ') || true
+    [ "$driver" = zfs ] || { echo "storage pool ${pool} uses ${driver:-?}, only zfs is supported"; return 1; }
+    echo "$pool $root"
+}
+
+# borg settings from zk2-env, exported for borg. An empty BORG_RSH is not
+# exported: borg would take it as an empty ssh command.
+zk2_borg_env() {
+    zk2_load_env BORG_REPO BORG_PASSPHRASE
+    export BORG_REPO BORG_PASSPHRASE
+    [ -z "${BORG_RSH:-}" ] || export BORG_RSH
+}
+
+# Wait for systemd inside an instance to finish booting. The STATE counts,
+# not the exit code: is-system-running exits non-zero on "degraded" - booted,
+# with a failed unit - and waiting for zero would sit out the whole timeout
+# on an instance that was ready in seconds.
+zk2_ct_wait_systemd() {
+    local ct=$1 tries=${2:-30} i=0
+    while [ "$i" -lt "$tries" ]; do
+        case "$(incus exec "$ct" -- systemctl is-system-running </dev/null 2>/dev/null || true)" in
+            running|degraded) return 0 ;;
+        esac
+        i=$(( i + 1 )); sleep 2
+    done
+    return 1
+}
+
+# zk2_ct_config_apply NAME FILE [NAME_IN_FILE]
+#
+# Give a restored instance the configuration of its source: limits, swap,
+# autostart, nesting, root size. All of it lives in the Incus database, not in
+# the instance's root; an archive carries the root, and an instance created
+# from a base image comes up with the image's settings - the memory of the
+# whole node and a root the size of the pool.
+#
+# FILE is Incus JSON: one instance (incus query /1.0/instances/NAME) or a list
+# (instances.json from the host backup). NAME_IN_FILE is for a probe restored
+# under another name.
+#
+# Not carried over: volatile.* and image.* (Incus keeps them: MAC, UUID, the
+# image record - foreign values would break both), profiles (the instance
+# gets default), eth0 (the address comes from the restore map), other devices
+# (paths and addresses may differ at the new place - listed, not copied).
+zk2_ct_config_apply() {
+    local ct=$1 src=$2 want=${3:-$1} inst kv size extra n=0 rc=0
+    inst=$(jq -c --arg n "$want" 'if type == "array" then (.[] | select(.name == $n)) else . end' "$src" 2>/dev/null | head -1)
+    [ -n "$inst" ] || { zk2_warn "  no configuration of ${want} in ${src} - default limits stay"; return 1; }
+
+    # One key at a time: a key the local Incus does not accept would fail a
+    # combined call and hide which one it was. NUL separated: values can be
+    # multi-line (raw.lxc, cloud-init.*).
+    while IFS= read -r -d '' kv; do
+        if incus config set "$ct" "$kv" </dev/null 2>/dev/null; then
+            n=$(( n + 1 ))
+        else
+            zk2_warn "  key ${kv%%=*} not accepted"; rc=1
+        fi
+    done < <(jq -j '.config // {} | to_entries[] | select(.key | test("^(volatile|image)\\.") | not)
+                    | "\(.key)=\(.value)\u0000"' <<<"$inst")
+
+    # Root size is a device property: override when the device comes from a
+    # profile (the usual case), set when the instance has its own.
+    size=$(jq -r '.devices.root.size // empty' <<<"$inst")
+    if [ -n "$size" ]; then
+        incus config device override "$ct" root size="$size" </dev/null >/dev/null 2>&1 \
+            || incus config device set "$ct" root size="$size" </dev/null >/dev/null 2>&1 \
+            || { zk2_warn "  root size ${size} not set"; rc=1; }
+    fi
+    zk2_ok "  source configuration: ${n} keys, memory $(jq -r '.config["limits.memory"] // "unlimited"' <<<"$inst"), root ${size:-unlimited}"
+
+    extra=$(jq -r '.devices // {} | keys[]' <<<"$inst" | grep -vxE 'root|eth0' || true)
+    [ -z "$extra" ] || zk2_warn "  devices NOT carried over, add them by hand: $(tr '\n' ' ' <<<"$extra")"
+    return $rc
+}

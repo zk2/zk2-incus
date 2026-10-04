@@ -1,0 +1,157 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# What the backup repository holds: overview, freshness, how to restore.
+#
+#   zk2-archives          overview of every instance
+#   zk2-archives NAME     one instance: ALL its archives with dates, and how
+#                         to restore from them (_host for the node itself)
+#   zk2-archives all      the whole repository, nothing folded
+#
+# THE POINT IS THE MISMATCHES, NOT THE LIST. A list of archives reassures by
+# itself - lines are there, so all is well. The overview compares it with the
+# inventory and marks:
+#
+#   in the inventory, no archives at all   - not protected (shown separately:
+#                                            a missing line is easy to miss)
+#   newest archive too old for the policy  - the nightly run did not work
+#   archives of an instance not listed     - leftovers of a removed instance;
+#                                            they take space, deleting them is
+#                                            a decision, not a cleanup
+#
+# Freshness thresholds in hours, node.conf: FRESH_DAILY_H [30],
+# FRESH_WEEKLY_H [192], FRESH_MONTHLY_H [840].
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_cmd borg
+
+MODE=${1:-overview}
+case "$MODE" in -h|--help) sed -n '4,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+zk2_load_node
+zk2_borg_env
+INVENTORY=${ZK2_INVENTORY:-${ZK2_CONF_DIR}/inventory.conf}
+# A day plus room for a long run: an archive taken at 05:05 is not stale at
+# 05:04 the next day. Monthly is taken at 30 days; five days of room.
+FRESH_DAILY_H=${FRESH_DAILY_H:-30}
+FRESH_WEEKLY_H=${FRESH_WEEKLY_H:-192}
+FRESH_MONTHLY_H=${FRESH_MONTHLY_H:-840}
+
+# ONE borg call for everything: listing over the network is not free, and
+# every view is built from the same data.
+ALL=$(borg list --format '{archive}{TAB}{time:%s}{NL}' 2>/dev/null) \
+    || zk2_die "cannot read the repository ${BORG_REPO}"
+[ -n "$ALL" ] || zk2_die "the repository has no archives"
+NOW=$(date +%s)
+
+age() {
+    local h=$(( $1 / 3600 ))
+    if [ "$h" -lt 48 ]; then printf '%d h' "$h"; else printf '%d d' $(( h / 24 )); fi
+}
+line() { printf '  %-44s %s (%s)\n' "$1" "$(date -d "@$2" '+%F %H:%M')" "$(age $(( NOW - $2 )))"; }
+
+show_repo() {
+    printf '== repository\n\n%s\n' "$BORG_REPO"
+    borg info 2>/dev/null | awk '/^All archives:/ { printf "  all archives: %s %s original, %s %s compressed, %s %s stored\n", $3,$4,$5,$6,$7,$8 }'
+    printf '  archives: %d\n' "$(grep -c . <<<"$ALL")"
+}
+
+show_overview() {
+    local names inv n policy cnt first last a mark missing="" others
+    names=$(awk -F'\t' '$1 ~ /@/ { sub(/@.*/, "", $1); print $1 }' <<<"$ALL" | sort -u)
+    inv=""
+    [ -r "$INVENTORY" ] && inv=$(grep -vE '^[[:space:]]*(#|$)' "$INVENTORY" || true)
+
+    printf '\n== instances\n\n'
+    printf '%-24s %-8s %5s  %-10s  %-16s  %s\n' NAME POLICY COUNT OLDEST NEWEST AGE
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        read -r cnt first last < <(awk -F'\t' -v p="${n}@" 'index($1, p) == 1 {
+            c++; if (!f || $2 < f) f = $2; if ($2 > l) l = $2 } END { print c, f, l }' <<<"$ALL")
+        policy=$(awk -v n="$n" '$1 == n { print $2; exit }' <<<"$inv")
+        # The node's own archive is not in the inventory, but it is taken
+        # every night and its staleness matters as much as a daily one's.
+        [ "$n" = _host ] && policy=daily
+        a=$(( NOW - last )); mark=""
+        case "${policy:-}" in
+            daily)   [ "$a" -le $(( FRESH_DAILY_H * 3600 )) ]   || mark="  STALE" ;;
+            weekly)  [ "$a" -le $(( FRESH_WEEKLY_H * 3600 )) ]  || mark="  STALE" ;;
+            monthly) [ "$a" -le $(( FRESH_MONTHLY_H * 3600 )) ] || mark="  STALE" ;;
+            "")      policy="-"; mark="  not in the inventory" ;;
+        esac
+        printf '%-24s %-8s %5s  %-10s  %-16s  %s%s\n' "$n" "$policy" "$cnt" \
+            "$(date -d "@${first}" '+%F')" "$(date -d "@${last}" '+%F %H:%M')" "$(age "$a")" "$mark"
+    done <<<"$names"
+
+    while read -r n policy _; do
+        [ -n "$n" ] || continue
+        grep -qxF -- "$n" <<<"$names" || missing+=" ${n}(${policy})"
+    done <<<"$inv"
+    [ -z "$missing" ] || printf '\nNO ARCHIVES AT ALL:%s\nExpected for policy none; for daily it is a problem.\n' "$missing"
+
+    others=$(awk -F'\t' '$1 !~ /@/' <<<"$ALL")
+    if [ -n "$others" ]; then
+        printf '\n== other archives (not NAME@STAMP, never pruned)\n\n'
+        while IFS=$'\t' read -r n a; do line "$n" "$a"; done <<<"$others"
+    fi
+}
+
+show_one() {
+    local name=$1 rows last
+    rows=$(awk -F'\t' -v p="${name}@" 'index($1, p) == 1' <<<"$ALL" | sort -t$'\t' -k2 -n)
+    [ -n "$rows" ] || zk2_die "no archives of ${name}"
+    printf '\n== archives of %s\n\n' "$name"
+    while IFS=$'\t' read -r n a; do line "$n" "$a"; done <<<"$rows"
+    last=$(tail -1 <<<"$rows" | cut -f1)
+    printf '\n== newest: %s\n\n' "$last"
+    borg info "::${last}" 2>/dev/null | awk '/^Number of files:/ { printf "  files: %s\n", $4 }
+        /^This archive:/ { printf "  size: %s %s original, %s %s new in the repository\n", $3,$4,$7,$8 }'
+
+    if [ "$name" = _host ]; then
+        cat <<'EOF'
+
+This is the root of the node. Never unpack it over new disks: build the node
+anew and take files from it, for example:
+    (set -a; . /etc/zk2/zk2-env; borg extract "::ARCHIVE" etc/zk2/zk2-env root/.ssh)
+EOF
+        return
+    fi
+    cat <<EOF
+
+== how to restore
+
+  the instance, newest archive:
+      zk2-restore one ${name}
+      zk2-restore --force one ${name}         # replace the existing one
+  from this very archive:
+      zk2-restore one ${name} --archive ${last}
+  look at an old copy WITHOUT touching the working one:
+      zk2-restore one ${name} --archive ${last} --as ${name}-probe
+      incus delete -f ${name}-probe           # when done
+  with its limits and root size (from the host backup):
+      zk2-restore one ${name} --config /var/lib/zk2/host-state/instances.json
+  a single file or directory, touching nothing:
+      mkdir -p /mnt/arch && (set -a; . /etc/zk2/zk2-env; borg mount "::${last}" /mnt/arch)
+      cp -a /mnt/arch/path/to/file /somewhere && borg umount /mnt/arch
+  read one file without unpacking:
+      (set -a; . /etc/zk2/zk2-env; borg extract --stdout "::${last}" etc/nginx/nginx.conf)
+
+A file-level VM archive has no kernel and no boot loader: files can be taken
+from it, a bootable VM cannot. VMs on the monthly policy are archived whole
+and restore with zk2-restore.
+EOF
+}
+
+show_all() {
+    printf '\n== all archives (%d)\n\n' "$(grep -c . <<<"$ALL")"
+    # By NAME, not by date: an instance's history reads in one block.
+    sort -t$'\t' -k1,1 <<<"$ALL" | while IFS=$'\t' read -r n a; do line "$n" "$a"; done
+}
+
+case "$MODE" in
+    overview) show_repo; show_overview ;;
+    all)      show_repo; show_all ;;
+    -*)       zk2_die "unknown option: ${MODE}" ;;
+    *)        show_repo; show_one "$MODE" ;;
+esac

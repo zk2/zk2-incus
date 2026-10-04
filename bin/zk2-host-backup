@@ -1,0 +1,131 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Back up the node itself: the host root file system -> borg, same repository.
+#
+# Usage: zk2-host-backup [--dry-run]
+#
+# Why. zk2-backup archives the instances, but the host holds what is neither
+# in git nor in any instance: zk2-env with the borg passphrase, root and borg
+# keys, sshd host keys, the mail relay config, the Incus certificate other
+# nodes trust, crontabs. When both disks die, all of it would otherwise be
+# rebuilt from memory.
+#
+# EVERYTHING on the root file system is archived, not a list of wanted files:
+# fewer exclusions, fewer chances to leave out what turns out to matter. A
+# host root is a few gigabytes, and nightly increments are tiny.
+#
+# The boundary is the root file system (--one-file-system), and that is all
+# the exclusions at once: /proc, /sys, /dev, /run, the ZFS datasets of the
+# instances, mounted snapshots, /boot/efi.
+#
+# DO NOT UNPACK THIS ARCHIVE OVER NEW DISKS. It carries RAID UUIDs, boot
+# entries, interface names, the public address. Build the node anew and take
+# single files out of the archive.
+#
+# Not a consistent snapshot: the live root is read. For /etc and keys that
+# does not matter, but the Incus database under /var/lib/incus may come out
+# torn - so a plain-text dump of the node state is written next to it first
+# (/var/lib/zk2/host-state): networks, profiles, storage, and the
+# configuration of every instance (instances.json, the file zk2-restore
+# --config takes).
+#
+# Archive name: _host@STAMP. Incus does not allow "_" in instance names, so
+# instance pruning ("NAME@*") and restores never touch it, and host pruning
+# never touches an instance.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd borg flock
+
+DRY_RUN=0
+case "${1:-}" in
+    --dry-run) DRY_RUN=1 ;;
+    "") ;;
+    -h|--help) sed -n '4,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown option: $1" ;;
+esac
+
+zk2_load_node
+zk2_borg_env
+KEEP_DAILY=${KEEP_DAILY:-7}
+KEEP_WEEKLY=${KEEP_WEEKLY:-4}
+KEEP_MONTHLY=${KEEP_MONTHLY:-6}
+STATE=${ZK2_HOST_STATE:-/var/lib/zk2/host-state}
+ARCHIVE="_host@$(date +%FT%H%M)"
+
+if [ "$DRY_RUN" = 1 ]; then
+    echo "would archive / (one file system) as ${ARCHIVE}, state dump in ${STATE}"
+    exit 0
+fi
+
+# The same lock as zk2-backup: one repository, one writer.
+mkdir -p /run/lock
+exec 9>/run/lock/zk2-backup.lock
+flock -n 9 || zk2_die "a backup run is already in progress"
+
+# --------------------------------------------------------------------------
+# Plain-text state dump
+#
+# Each command on its own: one failing must not take the others with it. A
+# failure is written into the file itself - an empty file read on the day of
+# a disaster would look like "there was nothing".
+# --------------------------------------------------------------------------
+
+mkdir -p "$STATE"
+chmod 700 "$STATE"
+
+dump() {
+    local file=$1; shift
+    "$@" </dev/null >"${STATE}/${file}" 2>&1 \
+        || printf '\n!!! command failed: %s\n' "$*" >>"${STATE}/${file}"
+}
+
+dump incus-init.yaml    incus admin init --dump
+dump instances.json     incus query '/1.0/instances?recursion=1'
+dump incus-list.txt     incus list -c nsNt4 --format csv
+# shellcheck disable=SC2016
+dump incus-profiles.txt sh -c 'for p in $(incus profile list --format csv -c n); do echo "=== $p"; incus profile show "$p"; done'
+dump incus-trust.txt    incus config trust list --format csv
+dump incus-remotes.txt  incus remote list --format csv
+dump zfs-list.txt       zfs list -o name,used,avail,refer,mountpoint,refquota
+dump zpool-status.txt   zpool status
+dump lsblk.txt          lsblk -f
+dump mdstat.txt         cat /proc/mdstat
+dump ip-addr.txt        ip -d addr
+dump ip-route.txt       sh -c 'ip route; echo; ip -6 route'
+dump nft.txt            nft list ruleset
+dump packages.txt       dpkg --get-selections
+dump crontab.txt        crontab -l
+date '+%F %T' >"${STATE}/stamp"
+
+# --------------------------------------------------------------------------
+# Archive
+#
+# The borg cache is the one exclusion: it is written by this very run, would
+# be archived mid-write, and rebuilds itself from the repository.
+# --------------------------------------------------------------------------
+
+t0=$(date +%s)
+rc=0
+if stats=$(borg create --stats --compression zstd --numeric-ids --one-file-system \
+        --exclude /root/.cache/borg "::${ARCHIVE}" / 2>&1); then
+    size=$(awk '/^This archive:/ { printf "%s %s, %s %s new in the repository", $3, $4, $7, $8 }' <<<"$stats")
+    echo "  host: ok, ${ARCHIVE}, ${size:-?}, $(( $(date +%s) - t0 )) s"
+elif grep -q '^This archive:' <<<"$stats"; then
+    # borg exits 1 on warnings - a file changed while it was read, normal on
+    # a live root; the archive exists. Errors are exit code 2.
+    echo "  host: ok with warnings, ${ARCHIVE}"
+    grep -iE 'changed while|warning' <<<"$stats" | head -5 | sed 's/^/    /'
+else
+    echo "  host: BORG FAILED: $(tail -2 <<<"$stats" | tr '\n' ' ')"
+    rc=1
+fi
+
+if [ "$rc" = 0 ]; then
+    borg prune --glob-archives "_host@*" --keep-daily="$KEEP_DAILY" \
+        --keep-weekly="$KEEP_WEEKLY" --keep-monthly="$KEEP_MONTHLY" >/dev/null 2>&1 \
+        || { echo "  host prune: FAILED"; rc=1; }
+fi
+exit $rc

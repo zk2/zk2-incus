@@ -52,10 +52,7 @@ done
 zk2_load_node
 # The passphrase sits in zk2-env, mode 600. That is the price of unattended
 # backups: whoever gets root on the node can read the archives.
-zk2_load_env BORG_REPO BORG_PASSPHRASE
-export BORG_REPO BORG_PASSPHRASE
-# An empty BORG_RSH would be taken as an empty ssh command.
-[ -z "${BORG_RSH:-}" ] || export BORG_RSH
+zk2_borg_env
 
 INVENTORY=${ZK2_INVENTORY:-${ZK2_CONF_DIR}/inventory.conf}
 HOOK_DIRS=("${ZK2_CONF_DIR}/hooks" "$(dirname "$(readlink -f "$0")")/../hooks")
@@ -87,24 +84,6 @@ report() { REPORT+="$1"$'\n'; }
 
 instances=$(incus query "/1.0/instances?recursion=1" </dev/null)
 inst() { jq -r --arg n "$1" ".[] | select(.name == \$n) | $2" <<<"$instances"; }
-
-# --------------------------------------------------------------------------
-# Where an instance lives in ZFS
-# --------------------------------------------------------------------------
-
-# The dataset is asked from Incus, not assembled from a pool name in config:
-# the instance's root device names the storage pool, and the pool's
-# zfs.pool_name names the ZFS dataset under which Incus keeps it ("tank",
-# "tank/incus", ...). Anything but the zfs driver is refused by name.
-zfs_root_of() {
-    local pool driver root
-    pool=$(inst "$1" '.expanded_devices.root.pool // empty')
-    [ -n "$pool" ] || { echo "no root disk pool"; return 1; }
-    read -r driver root < <(incus query "/1.0/storage-pools/${pool}" </dev/null \
-        | jq -r '[.driver, (.config["zfs.pool_name"] // .name)] | @tsv' | tr '\t' ' ') || true
-    [ "$driver" = zfs ] || { echo "storage pool ${pool} uses ${driver:-?}, only zfs is supported"; return 1; }
-    echo "$root"
-}
 
 # --------------------------------------------------------------------------
 # Hooks
@@ -161,7 +140,8 @@ backup_ct() {
     snap="zk2-${STAMP}"
     mnt="${RUN_DIR}/${ct}"
 
-    root=$(zfs_root_of "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    root=$(zk2_storage "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    root=${root#* }
     [ "$DRY_RUN" = 1 ] && { report "  ${ct}: would archive ${ct}@${STAMP}"; return 0; }
 
     # Cleanup runs whatever happens: a forgotten snapshot holds space and
@@ -219,7 +199,8 @@ backup_vm() {
     snap="zk2-${STAMP}"
     mnt="${RUN_DIR}/${ct}"
 
-    root=$(zfs_root_of "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    root=$(zk2_storage "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    root=${root#* }
     clone="${root}/zk2-vmbackup-${ct}"
     dev="/dev/zvol/${clone}"
     [ "$DRY_RUN" = 1 ] && { report "  ${ct}: VM, would archive ${ct}@${STAMP}"; return 0; }

@@ -112,6 +112,7 @@ above (or `ZK2_FLEET`).
 | `/etc/zk2/node.conf` | node parameters | `zk2-deploy`, from your fleet |
 | `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your fleet |
 | `/etc/zk2/inventory.conf` | what is backed up, how often, with which hook | `zk2-deploy`, from your fleet |
+| `/etc/zk2/restore.conf` | restore map: archive, name, address, wave | `zk2-deploy`, from your fleet |
 | `/etc/zk2/hooks/` | your own pre-backup hooks | `zk2-deploy`, mirrored from your fleet |
 | `/etc/zk2/zk2-env.dist` | template of the secrets file | `zk2-deploy` |
 | `/etc/zk2/zk2-env` | secrets: borg repository and passphrase, report address | **you**, from the template, mode 600; never in git, never overwritten |
@@ -127,19 +128,32 @@ editor /etc/zk2/zk2-env                  # BORG_REPO, BORG_PASSPHRASE, ZK2_EMAIL
 Keep the passphrase and `borg key export --paper` outside the node: without
 them no archive can be read.
 
-Nightly report on the node, mailed to `ZK2_EMAIL` from `zk2-env` through
-any of sendmail, msmtp or ssmtp. By default it comes every night, "OK" or
-"findings" in the subject, so a missing mail is a signal too;
-`MAIL_WHEN=problems` in `node.conf` limits it to nights with findings.
+The nightly run backs up the instances, then the host, then checks health,
+and mails one report to `ZK2_EMAIL` from `zk2-env` through any of sendmail,
+msmtp or ssmtp. By default the mail comes every night, "ok" or "FAILED" in
+the subject, so a missing mail is a signal too; `MAIL_WHEN=problems` in
+`node.conf` limits it to nights with problems.
 
 ```
-# /etc/cron.d/zk2 - until zk2-nightly runs both in order
-0 3 * * * root /usr/local/sbin/zk2-backup --mail
-30 5 * * * root /usr/local/sbin/zk2-health --mail
+# /etc/cron.d/zk2
+0 3 * * * root /usr/local/sbin/zk2-nightly
 ```
 
-Keep health well after the backup: run alongside it, it reports the
-working snapshot of the backup as left over.
+### On the day of a disaster
+
+Build the node anew, deploy it, put `zk2-env` back (from your password
+manager, or from the host archive of another copy), then:
+
+```sh
+zk2-archives                                    # what there is, how fresh
+mkdir -p /root/restore && cd /root/restore
+(set -a; . /etc/zk2/zk2-env; borg extract "::$(borg list --glob-archives '_host@*' --last 1 --format '{archive}')" var/lib/zk2/host-state)
+zk2-restore wave 1 --config /root/restore/var/lib/zk2/host-state/instances.json
+zk2-restore wave 2 --config /root/restore/var/lib/zk2/host-state/instances.json
+```
+
+`--config` gives the instances back their limits and root sizes, which live
+in the Incus database and not in the archives.
 
 Log in as root over ssh; the node needs `rsync`. The ssh alias is the node
 directory name unless `SSH_HOST` in `node.conf` says otherwise.
@@ -150,7 +164,11 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
 | `zk2-fleet` | workstation | create a fleet, add a node from the example |
+| `zk2-nightly` | node | backup, host backup and health in order, one report |
 | `zk2-backup` | node | snapshot, read-only mount, borg: containers, VMs (files, or whole on the monthly policy), pre-backup database dumps, per-instance retention |
+| `zk2-host-backup` | node | the node's own root file system and a plain-text dump of its Incus state |
+| `zk2-restore` | node | restore by the map, in waves; one instance from a given archive; a probe under another name; limits from the host dump; whole VMs |
+| `zk2-archives` | node | what the repository holds, what is stale or missing, how to restore |
 | `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, backup inventory, leftover snapshots, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
