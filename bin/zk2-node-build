@@ -228,7 +228,7 @@ step_zfs() {
         # shellcheck disable=SC2086
         run zpool create -f -o ashift=12 -O compression=zstd -O atime=off \
             -O xattr=sa -O acltype=posixacl -m none "$ZFS_POOL" mirror $ZFS_DISKS
-        zk2_ok "pool ${ZFS_POOL} created as a mirror"
+        [ "$DRY_RUN" = 1 ] || zk2_ok "pool ${ZFS_POOL} created as a mirror"
     fi
     [ "$DRY_RUN" = 1 ] || zpool status "$ZFS_POOL" >&2
 }
@@ -504,6 +504,7 @@ step_incus
 step_firewall
 step_vpn_route
 
+if [ "$DRY_RUN" = 1 ]; then zk2_warn "dry run finished: nothing was changed"; exit 0; fi
 zk2_ok "node build finished"
 cat >&2 <<EOF
 
