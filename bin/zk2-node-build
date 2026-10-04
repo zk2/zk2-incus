@@ -156,15 +156,16 @@ step_checks() {
 # all three were missing on a fresh node the first time. msmtp-mta provides
 # /usr/sbin/sendmail; configure /etc/msmtprc by hand (it holds a password).
 # borgbackup is 1.4 in Debian 13; do not install borg 2, it needs a
-# repository conversion.
+# repository conversion. column (zk2-list) is in bsdextrautils, which a
+# minimal cloud install of Debian 13 lacks - found on the test node.
 step_prereqs() {
     local c need=""
-    for c in curl gpg borg jq msmtp nft; do command -v "$c" >/dev/null 2>&1 || need+=" ${c}"; done
-    [ -n "$need" ] || { zk2_ok "curl, gpg, borg, jq, msmtp, nft present"; return 0; }
+    for c in curl gpg borg jq msmtp nft column; do command -v "$c" >/dev/null 2>&1 || need+=" ${c}"; done
+    [ -n "$need" ] || { zk2_ok "curl, gpg, borg, jq, msmtp, nft, column present"; return 0; }
     zk2_log "== installing:${need}"
     run apt-get update -qq
     run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl gnupg ca-certificates borgbackup jq msmtp msmtp-mta nftables
+        curl gnupg ca-certificates borgbackup jq msmtp msmtp-mta nftables bsdextrautils
 }
 
 # --------------------------------------------------------------------------
