@@ -1,0 +1,144 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# The Incus API between the nodes of the fleet, so that incus copy/move work
+# directly - from /etc/zk2/peers, which zk2-deploy builds from the fleet.
+#
+#   zk2-incus-peers diff     compare with the node (changes nothing)
+#   zk2-incus-peers apply    bring the node to the description
+#
+# Four parts, in this order:
+#
+#   1. firewall  the API port open to the peers' addresses only: the set
+#                "peers" of table inet zk2 (zk2-node-build), filled from
+#                /etc/nftables.d/zz-zk2-peers.nft
+#   2. listener  core.https_address=:8443
+#   3. trust     the peers' client certificates in the trust store, as node-PEER
+#   4. remotes   the peers in "incus remote list"; the server certificate is
+#                checked against the fingerprint from the fleet, not accepted
+#                on its word
+#
+# A trusted Incus client is a full administrator: it can create a privileged
+# container, which is root on the host - the same as root over ssh between
+# the nodes, not more.
+#
+# A peer can be added as a remote only once it trusts this node, so when a
+# pair is first set up apply runs twice on each node: the first pass hands
+# out trust, the second adds the remotes. A missing remote is a warning.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus nft openssl
+
+SRC=${ZK2_PEERS_DIR:-${ZK2_CONF_DIR}/peers}
+NFT_FILE=${ZK2_PEERS_NFT:-/etc/nftables.d/zz-zk2-peers.nft}
+CERT_DIR=/root/.config/incus/servercerts
+API_PORT=8443
+LISTEN=":${API_PORT}"
+
+MODE=${1:-diff}
+case "$MODE" in
+    diff|apply) ;;
+    -h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown mode: ${MODE} (diff or apply)" ;;
+esac
+# incus waits for the end of stdin before talking to the daemon; where input
+# is needed (remote add) it is given explicitly.
+exec </dev/null
+
+[ -r "${SRC}/incus_peers.conf" ] || zk2_die "no ${SRC}/incus_peers.conf - deploy the node with zk2-deploy first"
+# name address server-fingerprint client-fingerprint
+mapfile -t PEERS < <(grep -vE '^[[:space:]]*(#|$)' "${SRC}/incus_peers.conf")
+
+drift=0
+note() { drift=1; zk2_warn "$*"; }
+
+# 1. Firewall
+nft list set inet zk2 peers >/dev/null 2>&1 || zk2_die "no set peers in table inet zk2 - run zk2-node-build --firewall-only"
+want_nft=$(mktemp)
+trap 'rm -f "$want_nft"' EXIT
+{
+    echo "# Peer node addresses for the Incus API. Written by zk2-incus-peers from"
+    echo "# ${SRC}/incus_peers.conf - do not edit. Loads after zk2.nft (alphabetical),"
+    echo "# which declares the set empty."
+    echo "flush set inet zk2 peers"
+    ips=""
+    for row in ${PEERS[@]+"${PEERS[@]}"}; do read -r _ ip _ _ <<<"$row"; ips="${ips:+${ips}, }${ip}"; done
+    [ -z "$ips" ] || echo "add element inet zk2 peers { ${ips} }"
+} > "$want_nft"
+nft_now=$(nft list set inet zk2 peers 2>/dev/null)
+nft_ok=1
+if ! [ -f "$NFT_FILE" ] || ! cmp -s "$NFT_FILE" "$want_nft"; then
+    nft_ok=0; note "firewall: ${NFT_FILE} differs from the description"
+fi
+for row in ${PEERS[@]+"${PEERS[@]}"}; do
+    read -r peer ip _ _ <<<"$row"
+    grep -qw -- "$ip" <<<"$nft_now" || { nft_ok=0; note "firewall: ${peer} (${ip}) not in the set peers"; }
+done
+if [ "$MODE" = apply ] && [ "$nft_ok" = 0 ]; then
+    install -m 644 "$want_nft" "${NFT_FILE}.zk2-new" && mv -f "${NFT_FILE}.zk2-new" "$NFT_FILE"
+    nft -f "$NFT_FILE"
+    zk2_ok "firewall: set peers applied"
+fi
+
+# 2. Listener
+have=$(incus config get core.https_address)
+if [ "$have" != "$LISTEN" ]; then
+    note "listener: core.https_address='${have}', want '${LISTEN}'"
+    [ "$MODE" != apply ] || { incus config set core.https_address="$LISTEN"; zk2_ok "listener: ${LISTEN}"; }
+fi
+
+# 3. Trust (trust list shows names and the first 12 characters of fingerprints)
+trust_now=$(incus config trust list --format csv -c nf)
+for row in ${PEERS[@]+"${PEERS[@]}"}; do
+    read -r peer _ _ cfp <<<"$row"
+    grep -q ",${cfp:0:12}\$" <<<"$trust_now" && continue
+    note "trust: ${peer} (${cfp:0:12}) not trusted"
+    [ "$MODE" != apply ] || { incus config trust add-certificate "${SRC}/client-${peer}.crt" --name "node-${peer}"; zk2_ok "trust: node-${peer} added"; }
+done
+# Stale: named node-*, fingerprint not among the peers - a node removed from
+# the fleet, or its previous certificate. Other entries are not ours.
+while IFS=, read -r name fp; do
+    [[ "$name" == node-* ]] || continue
+    keep=0
+    for row in ${PEERS[@]+"${PEERS[@]}"}; do read -r _ _ _ cfp <<<"$row"; [ "${cfp:0:12}" = "$fp" ] && keep=1; done
+    [ "$keep" = 1 ] && continue
+    note "trust: ${name} (${fp}) is not in the fleet"
+    [ "$MODE" != apply ] || { incus config trust remove "$fp"; zk2_ok "trust: ${name} removed"; }
+done <<<"$trust_now"
+
+# 4. Remotes
+remotes_now=$(incus remote list --format csv -c nu | sed 's/ ([^)]*),/,/')
+pending=""
+for row in ${PEERS[@]+"${PEERS[@]}"}; do
+    read -r peer ip sfp _ <<<"$row"
+    url="https://${ip}:${API_PORT}"
+    have_url=$(awk -F, -v n="$peer" '$1 == n { print $2 }' <<<"$remotes_now")
+    # Same address - and the same certificate, byte for byte: a reinstalled
+    # peer has a new one, and the remote must be added anew.
+    if [ "$have_url" = "$url" ] && cmp -s "${CERT_DIR}/${peer}.crt" "${SRC}/server-${peer}.crt"; then continue; fi
+    if [ -n "$have_url" ]; then
+        note "remote: ${peer} exists, but the address or certificate is wrong (${have_url})"
+        [ "$MODE" != apply ] || incus remote remove "$peer"
+    else
+        note "remote: ${peer} not added"
+    fi
+    [ "$MODE" = apply ] || continue
+    # The answer to "ok (y/n/[fingerprint])?" is the fingerprint from the
+    # fleet: a match is accepted, anything else refused - a substituted
+    # certificate does not pass.
+    if out=$(printf '%s\n' "$sfp" | incus remote add "$peer" "$url" --auth-type tls 2>&1); then
+        zk2_ok "remote: ${peer} added (${url})"
+    else
+        zk2_warn "remote: ${peer}: $(tail -1 <<<"$out")"; pending+=" ${peer}"
+    fi
+done
+
+if [ -n "$pending" ]; then
+    zk2_warn "remotes not added:${pending} - the peer does not trust this node yet, or is unreachable;"
+    zk2_warn "  run zk2-incus-peers apply there, then here again"
+    exit 1
+fi
+if [ "$drift" = 0 ]; then zk2_ok "Incus API peers match the description"
+elif [ "$MODE" = diff ]; then zk2_warn "differences above; apply: zk2-incus-peers apply"; exit 1; fi

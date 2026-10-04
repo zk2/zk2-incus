@@ -29,6 +29,9 @@
 #   /etc/zk2/restore.conf   from nodes/<NODE>/restore.conf (restore map)
 #   /etc/zk2/hooks/         from nodes/<NODE>/hooks/, mirrored (your hooks)
 #   /etc/zk2/zk2-env.dist   template of the secrets file
+#   /etc/zk2/peers/         the other nodes of the fleet, for zk2-ssh-config and
+#                           zk2-incus-peers; built here from their node.conf and
+#                           the public files zk2-fleet collect fetched, mirrored
 #   /etc/zk2/zk2-env        secrets: NEVER written by this script, create it
 #                           on the node from the template, mode 600
 #
@@ -148,6 +151,61 @@ rssh 'command -v rsync >/dev/null' \
     || die "rsync is not installed on ${NODE} (apt install rsync)"
 
 # --------------------------------------------------------------------------
+# Peers: what this node needs to know about the other nodes of the fleet
+# --------------------------------------------------------------------------
+#
+# Built HERE, because only the fleet knows all nodes; each node knows itself.
+# A peer is any other nodes/*/ with a node.conf. Its public files come from
+# zk2-fleet collect:
+#
+#   ssh/id_ed25519_nodes.pub      -> authorized_keys of this node, from="its address"
+#   ssh/ssh_host_ed25519_key.pub  -> known_hosts here: no "yes" on the first login
+#   incus/server.crt              -> this node's remote for it, fingerprint checked
+#   incus/client.crt              -> this node's Incus trust store
+#
+# A missing file is said aloud: a peer silently left out would look set up.
+build_peers() {
+    local out=$1 d peer ip port sfp cfp
+    mkdir -p "$out"
+    : > "${out}/ssh_config"; : > "${out}/ssh_known_hosts"; : > "${out}/ssh_authorized"; : > "${out}/incus_peers.conf"
+    for d in "${FLEET}"/nodes/*/; do
+        peer=$(basename "$d")
+        if [ "$peer" = "$NODE_NAME" ] || [ ! -r "${d}node.conf" ]; then continue; fi
+        # In a subshell: the peer's node.conf would overwrite this node's values.
+        read -r ip port < <( PUBLIC_IP="" SSH_PORT=""
+            # shellcheck source=/dev/null
+            . "${d}node.conf"; echo "${PUBLIC_IP:-} ${SSH_PORT:-22}" ) || true
+        [ -n "${ip:-}" ] || { say "note: ${peer} has no PUBLIC_IP - left out of the peers"; continue; }
+
+        printf 'Host %s\n    HostName %s\n    Port %s\n    User root\n    IdentityFile /root/.ssh/id_ed25519_nodes\n    IdentitiesOnly yes\n    UserKnownHostsFile /root/.ssh/known_hosts.d/zk2-nodes\n    StrictHostKeyChecking yes\n\n' \
+            "$peer" "$ip" "$port" >> "${out}/ssh_config"
+        if [ -r "${d}ssh/ssh_host_ed25519_key.pub" ]; then
+            printf '[%s]:%s %s\n' "$ip" "$port" "$(cut -d' ' -f1,2 "${d}ssh/ssh_host_ed25519_key.pub")" >> "${out}/ssh_known_hosts"
+        else
+            say "note: no nodes/${peer}/ssh/ssh_host_ed25519_key.pub - ssh ${peer} will fail host verification (zk2-fleet collect ${peer})"
+        fi
+        # from=: the address the peer comes from. Its containers leave the node
+        # under the same address, so this does not protect from them; not
+        # having the private key does.
+        if [ -r "${d}ssh/id_ed25519_nodes.pub" ]; then
+            printf 'from="%s" %s\n' "$ip" "$(cat "${d}ssh/id_ed25519_nodes.pub")" >> "${out}/ssh_authorized"
+        else
+            say "note: no nodes/${peer}/ssh/id_ed25519_nodes.pub - ${peer} will not be let in (zk2-fleet collect ${peer})"
+        fi
+        if [ -r "${d}incus/server.crt" ] && [ -r "${d}incus/client.crt" ]; then
+            # Fingerprints computed here: openssl is surely on the workstation.
+            sfp=$(openssl x509 -in "${d}incus/server.crt" -outform DER | sha256sum | cut -d' ' -f1)
+            cfp=$(openssl x509 -in "${d}incus/client.crt" -outform DER | sha256sum | cut -d' ' -f1)
+            printf '%s %s %s %s\n' "$peer" "$ip" "$sfp" "$cfp" >> "${out}/incus_peers.conf"
+            cp "${d}incus/server.crt" "${out}/server-${peer}.crt"
+            cp "${d}incus/client.crt" "${out}/client-${peer}.crt"
+        else
+            say "note: no nodes/${peer}/incus/{server,client}.crt - ${peer} stays out of the Incus API peers"
+        fi
+    done
+}
+
+# --------------------------------------------------------------------------
 # Code and node data
 # --------------------------------------------------------------------------
 
@@ -192,6 +250,12 @@ deploy_node() {
     # never overwrite it.
     cp "${ZK2_HOME}/examples/zk2-env.dist" "$stage/"
     "${RSYNC[@]}" --chmod=D755,F644 "${stage}/" "${NODE}:${R_ETC}/"
+
+    # Mirrored: a node removed from the fleet must leave the peers'
+    # authorized_keys and trust stores, not live on from an old deploy.
+    command -v openssl >/dev/null || die "openssl is required on the workstation"
+    build_peers "${MUX_DIR}/peers"
+    "${RSYNC[@]}" --delete --chmod=D755,F644 "${MUX_DIR}/peers/" "${NODE}:${R_ETC}/peers/"
 
     # Mirrored: zk2-publish takes the list of ACLs from the files here, and a
     # file removed from git but left on the node keeps demanding an ACL that

@@ -224,7 +224,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | Command | Where | What |
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
-| `zk2-fleet` | workstation | create a fleet, add a node from the example |
+| `zk2-fleet` | workstation | create a fleet, add a node from the example, collect a node's public keys and certificates for its peers |
 | `zk2-node-build` | node | build a node on fresh Debian 13: ZFS mirror, Incus from Zabbly, bridge, DHCP routes for the VPN, split DNS, host firewall |
 | `zk2-new-ct` | node | new instance by a short dialog: limits, isolated uid range, fixed address, cloud-init, docker if asked |
 | `zk2-base-profile` | node | the Incus profile base: user, passwords, ssh policy and keys, shell, packages - from `cloud-init/base.yaml` |
@@ -234,6 +234,9 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 | `zk2-restore` | node | restore by the map, in waves; one instance from a given archive; a probe under another name; limits from the host dump; whole VMs |
 | `zk2-archives` | node | what the repository holds, what is stale or missing, how to restore |
 | `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, VPN routes, split DNS, backup inventory, leftover snapshots, publication drift |
+| `zk2-ssh-config` | node | root's ssh to the peer nodes (aliases, host keys from the fleet, authorized keys) and a `borg` alias |
+| `zk2-incus-peers` | node | the Incus API between the nodes: firewall set, listener, trust, remotes with checked fingerprints |
+| `zk2-send` | node | deploy an instance from this node's archive onto a peer node, with its configuration |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-ssh-policy` | node | the ssh policy of node.conf (password login, root login) in existing instances: drop-in or in-place edit, cloud-init stub replaced, verified with sshd -t and sshd -T |
 | `zk2-shell` | node | the zk2 shell setup (history, prompt) in existing instances, and no foreign PS1 overriding it; `--check` only looks |

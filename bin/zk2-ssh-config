@@ -1,0 +1,135 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# root's ssh on the node: aliases of the peer nodes, their host keys, who may
+# come in - from /etc/zk2/peers, which zk2-deploy builds from the fleet.
+#
+#   zk2-ssh-config diff     compare with the node (changes nothing)
+#   zk2-ssh-config apply    bring /root/.ssh to the description
+#
+# After apply on every node: "ssh PEER" (the peer's directory name in the
+# fleet) as root with /root/.ssh/id_ed25519_nodes, its host key checked from
+# the fleet instead of a "yes" on the first login; and "ssh borg", an alias
+# of the borg repository from BORG_REPO and BORG_RSH in zk2-env.
+#
+# What it touches in /root/.ssh:
+#
+#   config                   only an Include line at the top; the rest is not ours
+#   config.d/zk2-nodes.conf  ours entirely
+#   config.d/zk2-borg.conf   ours entirely
+#   known_hosts.d/zk2-nodes  ours entirely
+#   authorized_keys          ONLY the block between the zk2-nodes markers; your
+#                            own keys outside it are never touched
+#
+# Trusting a peer node with root over ssh is a decision: a node whose root is
+# taken gives root on its peers. zk2-send needs it; leave a node out of the
+# fleet (or its key out of nodes/NODE/ssh) to keep it apart.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+
+SRC=${ZK2_PEERS_DIR:-${ZK2_CONF_DIR}/peers}
+DOT=${ZK2_SSH_DIR:-/root/.ssh}
+MARK_BEGIN='# >>> zk2-nodes: peer node keys, managed by zk2-ssh-config - do not edit'
+MARK_END='# <<< zk2-nodes'
+INCLUDE_LINE='Include config.d/*.conf'
+
+MODE=${1:-diff}
+case "$MODE" in
+    diff|apply) ;;
+    -h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) zk2_die "unknown mode: ${MODE} (diff or apply)" ;;
+esac
+
+for f in ssh_config ssh_known_hosts ssh_authorized; do
+    [ -r "${SRC}/${f}" ] || zk2_die "no ${SRC}/${f} - deploy the node with zk2-deploy first"
+done
+zk2_try_env
+
+WANT=$(mktemp -d)
+trap 'rm -rf "$WANT"' EXIT
+
+{
+    echo "# Peer nodes of this fleet. Written by zk2-ssh-config from ${SRC};"
+    echo "# change the fleet, not this file."
+    echo
+    cat "${SRC}/ssh_config"
+} > "${WANT}/zk2-nodes.conf"
+cp "${SRC}/ssh_known_hosts" "${WANT}/zk2-nodes"
+
+# "ssh borg": the repository host with the key borg itself uses, for manual
+# work. BORG_REPO keeps its full address: borg remembers where a repository
+# was and asks "repository was moved, continue?" when it changes - nobody
+# answers that at night.
+: > "${WANT}/zk2-borg.conf"
+if [[ "${BORG_REPO:-}" =~ ^ssh://([^@/]+)@([^:/]+)(:([0-9]+))?/ ]]; then
+    b_user=${BASH_REMATCH[1]} b_host=${BASH_REMATCH[2]} b_port=${BASH_REMATCH[4]:-22} key=""
+    if [[ "${BORG_RSH:-}" =~ -i[[:space:]]+([^[:space:]]+) ]]; then key=${BASH_REMATCH[1]}; fi
+    {
+        echo "# The borg repository of this node, from zk2-env. Written by zk2-ssh-config."
+        printf 'Host borg\n    HostName %s\n    User %s\n    Port %s\n' "$b_host" "$b_user" "$b_port"
+        [ -z "$key" ] || printf '    IdentityFile %s\n    IdentitiesOnly yes\n' "$key"
+    } > "${WANT}/zk2-borg.conf"
+fi
+
+# config: ours is only the Include line, FIRST - ssh takes the first value
+# per parameter, and an Include at the end would lose to any "Host *" block
+# added by hand.
+if [ -f "${DOT}/config" ]; then
+    if grep -qxF "$INCLUDE_LINE" "${DOT}/config"; then cp "${DOT}/config" "${WANT}/config"
+    else { printf '%s\n\n' "$INCLUDE_LINE"; cat "${DOT}/config"; } > "${WANT}/config"; fi
+else
+    printf '%s\n' "$INCLUDE_LINE" > "${WANT}/config"
+fi
+
+# authorized_keys: everything outside the block as is, the block anew.
+touch "${WANT}/authorized_keys"
+if [ -f "${DOT}/authorized_keys" ]; then
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' \
+        "${DOT}/authorized_keys" > "${WANT}/authorized_keys"
+fi
+# The worst outcome guarded against: no key outside the block means only the
+# peers could log in, not you (a key put inside the block by hand would be
+# dropped by apply).
+grep -qE '^[^#[:space:]]' "${WANT}/authorized_keys" \
+    || zk2_die "no key outside the zk2-nodes block in ${DOT}/authorized_keys - refusing, only the peers would be able to log in"
+if [ -s "${SRC}/ssh_authorized" ]; then
+    { printf '%s\n' "$MARK_BEGIN"; cat "${SRC}/ssh_authorized"; printf '%s\n' "$MARK_END"; } >> "${WANT}/authorized_keys"
+fi
+
+PAIRS=(
+    "${DOT}/config                  ${WANT}/config"
+    "${DOT}/config.d/zk2-nodes.conf ${WANT}/zk2-nodes.conf"
+    "${DOT}/config.d/zk2-borg.conf  ${WANT}/zk2-borg.conf"
+    "${DOT}/known_hosts.d/zk2-nodes ${WANT}/zk2-nodes"
+    "${DOT}/authorized_keys         ${WANT}/authorized_keys"
+)
+
+changed=0
+for p in "${PAIRS[@]}"; do
+    read -r dst src <<<"$p"
+    if [ -f "$dst" ] && cmp -s "$dst" "$src"; then continue; fi
+    changed=1
+    if [ -f "$dst" ]; then diff -u --label "$dst" --label "(to be)" "$dst" "$src" || true
+    else printf '+++ %s (new)\n' "$dst"; sed 's/^/+/' "$src"; fi
+done
+
+if [ "$changed" = 0 ]; then zk2_ok "root's ssh matches the description"; exit 0; fi
+if [ "$MODE" = diff ]; then zk2_warn "differences above; apply: zk2-ssh-config apply"; exit 1; fi
+
+# The node key is created on the first apply (zk2-fleet collect creates it
+# as well); its public part reaches the peers through the fleet.
+[ -f "${DOT}/id_ed25519_nodes" ] \
+    || ssh-keygen -q -t ed25519 -N '' -f "${DOT}/id_ed25519_nodes" -C "nodes@$(hostname)"
+
+install -d -m 700 "$DOT" "${DOT}/config.d" "${DOT}/known_hosts.d"
+# Through a temporary file and mv: an authorized_keys cut off halfway is a
+# locked node.
+for p in "${PAIRS[@]}"; do
+    read -r dst src <<<"$p"
+    [ -f "$dst" ] && cmp -s "$dst" "$src" && continue
+    install -m 600 "$src" "${dst}.zk2-new"
+    mv -f "${dst}.zk2-new" "$dst"
+    zk2_ok "written ${dst}"
+done

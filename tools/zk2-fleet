@@ -5,6 +5,8 @@
 #
 # Usage: zk2-fleet init DIR          create a fleet in DIR (new or empty)
 #        zk2-fleet add-node NAME     add nodes/NAME from examples/node
+#        zk2-fleet collect NODE      fetch the node's public keys and
+#                                    certificates into nodes/NODE (for peers)
 #
 # A fleet is a directory with a zk2-fleet.conf marker and nodes/<name>/ inside.
 # Keep it in its own private git repository, next to your zk2 checkout or
@@ -81,8 +83,46 @@ cmd_add_node() {
     say "  nodes/${name}/publication/  what is published and to whom (example data!)"
 }
 
+# Public parts of a node that its PEERS need, fetched into the fleet:
+#
+#   ssh/id_ed25519_nodes.pub       the key this node uses to reach other nodes
+#   ssh/ssh_host_ed25519_key.pub   its sshd host key, for the peers' known_hosts
+#   incus/server.crt               its Incus server certificate (peers' remotes)
+#   incus/client.crt               its Incus client certificate (peers' trust)
+#
+# The node key and the Incus client certificate are created on the node when
+# they do not exist yet. Only public material travels; private keys never
+# leave the node. zk2-deploy turns these files into the peer data of every
+# OTHER node of the fleet.
+cmd_collect() {
+    local name=${1:?usage: zk2-fleet collect NODE} fleet dir host SSH_HOST=""
+    fleet=$(find_fleet); dir="${fleet}/nodes/${name}"
+    [ -r "${dir}/node.conf" ] || die "no ${dir}/node.conf"
+    # shellcheck source=/dev/null
+    host=$( . "${dir}/node.conf"; echo "${SSH_HOST:-$name}" )
+    mkdir -p "${dir}/ssh" "${dir}/incus"
+    # One ssh session prints the four files between markers.
+    out=$(ssh -T "$host" 'set -e
+        [ -f /root/.ssh/id_ed25519_nodes ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519_nodes -C "nodes@$(hostname)"
+        [ -f /root/.config/incus/client.crt ] || incus remote generate-certificate >/dev/null 2>&1 || true
+        for f in /root/.ssh/id_ed25519_nodes.pub /etc/ssh/ssh_host_ed25519_key.pub /var/lib/incus/server.crt /root/.config/incus/client.crt; do
+            echo "=== $f"; cat "$f"
+        done') || die "ssh ${host} failed"
+    split() { awk -v f="$1" '/^=== / { on = ($2 == f); next } on' <<<"$out"; }
+    split /root/.ssh/id_ed25519_nodes.pub        > "${dir}/ssh/id_ed25519_nodes.pub"
+    split /etc/ssh/ssh_host_ed25519_key.pub      > "${dir}/ssh/ssh_host_ed25519_key.pub"
+    split /var/lib/incus/server.crt              > "${dir}/incus/server.crt"
+    split /root/.config/incus/client.crt         > "${dir}/incus/client.crt"
+    for f in ssh/id_ed25519_nodes.pub ssh/ssh_host_ed25519_key.pub incus/server.crt incus/client.crt; do
+        [ -s "${dir}/${f}" ] || die "empty ${dir}/${f} - see the output of the node"
+        say "  ${f}"
+    done
+    say "collected into ${dir}; commit, then zk2-deploy every node of the fleet"
+}
+
 case "${1:-}" in
     init)     shift; cmd_init "$@" ;;
+    collect)  shift; cmd_collect "$@" ;;
     add-node) shift; cmd_add_node "$@" ;;
-    *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
