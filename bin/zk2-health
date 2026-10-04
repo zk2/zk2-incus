@@ -295,6 +295,12 @@ fi
 
 if zk2_ct_running "$VPN_CT"; then
     while IFS='|' read -r what days; do
+        # A missing list is not an expiry: "expires in 0 days" would point at
+        # the wrong fix. Usually the server is not set up yet.
+        if [ "$days" = missing ]; then
+            add "VPN: no revocation list (/etc/openvpn/crl.pem) - server not set up (zk2-vpn-setup)? With crl-verify set, OpenVPN will not start"
+            continue
+        fi
         case "$days" in ''|*[!0-9-]*) continue ;; esac
         if [ "$days" -lt 0 ]; then
             add "VPN: ${what} EXPIRED $(( -days )) days ago"
@@ -318,7 +324,7 @@ if zk2_ct_running "$VPN_CT"; then
                 d=$(days_left crl /etc/openvpn/crl.pem)
                 [ -n "$d" ] && [ "$d" -lt '"$CRL_DAYS"' ] && echo "REVOCATION LIST|$d"
             else
-                echo "revocation list missing|0"
+                echo "revocation list|missing"
             fi' </dev/null 2>/dev/null || true
     )
     incus exec "$VPN_CT" -- sh -c '[ ! -e /etc/openvpn/crl.pem ] || su -s /bin/sh -c "test -r /etc/openvpn/crl.pem" nobody' \
