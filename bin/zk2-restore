@@ -196,12 +196,15 @@ restore_one() {
     # docker found wins, or its containers never come up.
     if [ -n "$CONF_FILE" ]; then
         zk2_ct_config_apply "$target" "$CONF_FILE" "$name" || true
-        # A probe must not come up by itself after a node reboot: its services
-        # would start a second time next to the working ones.
-        [ -z "$AS_NAME" ] || incus config set "$target" boot.autostart=false </dev/null
     else
         zk2_warn "  no --config: ${target} has no limits and no root size"
     fi
+    # A probe must not come up by itself after a node reboot: its services
+    # would start a second time next to the working ones. Always, with or
+    # without --config: an UNSET boot.autostart means "restore the last
+    # state", so a probe running at reboot would come back. After the
+    # configuration, which may carry the source's autostart=true.
+    [ -z "$AS_NAME" ] || incus config set "$target" boot.autostart=false </dev/null
     [ "$has_docker" = 0 ] || { incus config set "$target" security.nesting=true </dev/null; zk2_ok "  docker inside - security.nesting on"; }
 
     [ -n "$AS_NAME" ] || incus config device override "$target" eth0 ipv4.address="$addr" </dev/null >/dev/null
