@@ -1,0 +1,48 @@
+#!/bin/bash
+#
+# Dump PostgreSQL that runs in a docker container INSIDE an instance (a
+# compose stack, for example) before backup.
+#
+# Usage: dump-docker-postgres INSTANCE
+#        PG_CONTAINER=name dump-docker-postgres INSTANCE
+#
+# The postgres container is found by image, not by name: compose derives
+# names from the project directory, and a renamed project would make a
+# name-based hook dump nothing. Images recognized: postgres and common builds
+# of it (pgvector, timescaledb, postgis). Exactly one match is required - with
+# two, guessing which one to dump is not a hook's job; set PG_CONTAINER.
+#
+# pg_dumpall with the user from the container's own POSTGRES_USER: the local
+# socket in the official image is trusted, so no password is needed. See
+# README.md for the rules every hook follows.
+
+set -euo pipefail
+
+CT=${1:?usage: $(basename "$0") INSTANCE}
+DEST=${DEST:-/var/backups/zk2}
+PG_CONTAINER=${PG_CONTAINER:-}
+
+if [ -z "$PG_CONTAINER" ]; then
+    LIST=$(incus exec "$CT" -- docker ps --format '{{.Names}} {{.Image}}' </dev/null) || {
+        echo "${CT}: docker ps did not answer - is docker running in the instance?" >&2
+        exit 1
+    }
+    MATCH=$(printf '%s\n' "$LIST" \
+        | awk '$2 ~ /(^|\/)(postgres|pgvector|timescaledb[^:]*|postgis)(:|$)/ { print $1 }')
+    N=$(printf '%s' "$MATCH" | grep -c . || true)
+    if [ "$N" != 1 ]; then
+        echo "${CT}: ${N} running postgres containers, exactly one needed (set PG_CONTAINER):" >&2
+        printf '%s\n' "$LIST" >&2
+        exit 1
+    fi
+    PG_CONTAINER=$MATCH
+fi
+
+incus exec "$CT" -- sh -c "
+    set -e
+    mkdir -p '${DEST}' && chmod 700 '${DEST}'
+    docker exec '${PG_CONTAINER}' sh -c 'exec pg_dumpall -U \"\${POSTGRES_USER:-postgres}\"' \
+        > '${DEST}/docker-postgres.sql.tmp'
+    mv '${DEST}/docker-postgres.sql.tmp' '${DEST}/docker-postgres.sql'
+    chmod 600 '${DEST}/docker-postgres.sql'
+" </dev/null

@@ -1,0 +1,42 @@
+# Secrets of one node. Lives ONLY on the node, as /etc/zk2/zk2-env, mode 600,
+# owned by root. Never in git, never written by zk2-deploy (which places this
+# template next to it as zk2-env.dist).
+#
+#   cp /etc/zk2/zk2-env.dist /etc/zk2/zk2-env
+#   chmod 600 /etc/zk2/zk2-env
+#   editor /etc/zk2/zk2-env
+#
+# Plain shell variable assignments, sourced by bash.
+
+# Where reports go. Sent through whatever is installed: sendmail, msmtp or
+# ssmtp - configure one of them to relay through your SMTP provider.
+ZK2_EMAIL=ops@example.org
+
+# The borg repository. ONE PER NODE: a repository written from several
+# places is a source of lock contention and corruption. Reading another
+# node's repository is fine, given its passphrase.
+#
+# Any repository reachable over ssh works: your own server, a storage box,
+# BorgBase, rsync.net. Initialize it once from the node:
+#   borg init --encryption=repokey-blake2 "$BORG_REPO"
+BORG_REPO=ssh://backup@backup.example.org:22/./node1
+
+# The ssh command borg uses. Only when the default root key is not the one:
+# a dedicated key is not among ssh's default identities and is never offered,
+# and the refusal then looks like a password prompt, not a key error.
+# IdentitiesOnly=yes stops ssh from trying other keys first and hitting the
+# server's limit of attempts.
+#
+# Create the key ON THE NODE; the private part never leaves it:
+#   ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519_borg -C "borg@$(hostname)"
+#
+# On the day of a disaster the new machine does not have this key: restore
+# it from the host backup, or authorize a new key on the repository side.
+#BORG_RSH="ssh -i /root/.ssh/id_ed25519_borg -o IdentitiesOnly=yes"
+
+# The repository passphrase.
+#
+# KEEP IT OUTSIDE THE NODE TOO - in a password manager or on paper. Losing it
+# means losing every backup: nothing can decrypt them. Keep the output of
+# "borg key export --paper" next to it.
+BORG_PASSPHRASE=""

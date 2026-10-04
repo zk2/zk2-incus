@@ -1,0 +1,34 @@
+#!/bin/bash
+#
+# Dump all MariaDB / MySQL databases inside an instance before backup.
+#
+# Usage: dump-mariadb INSTANCE
+#
+# Runs as root over the unix socket (unix_socket / auth_socket), the default
+# on Debian and its derivatives, so no password is stored anywhere. See
+# README.md for the rules every hook follows.
+#
+# --single-transaction gives a consistent InnoDB snapshot without locking the
+# application. --default-character-set=utf8mb4 keeps four-byte characters
+# (emoji in user content) intact. --routines --events: they are not dumped by
+# default and are easy to miss until they are gone.
+
+set -euo pipefail
+
+CT=${1:?usage: $(basename "$0") INSTANCE}
+DEST=${DEST:-/var/backups/zk2}
+
+# shellcheck disable=SC2016
+DUMP=$(incus exec "$CT" -- sh -c 'command -v mariadb-dump || command -v mysqldump' </dev/null 2>/dev/null) || {
+    echo "${CT}: neither mariadb-dump nor mysqldump in the instance" >&2
+    exit 1
+}
+
+incus exec "$CT" -- sh -c "
+    set -e
+    mkdir -p '${DEST}' && chmod 700 '${DEST}'
+    ${DUMP} --all-databases --single-transaction --routines --events \
+        --default-character-set=utf8mb4 > '${DEST}/mariadb.sql.tmp'
+    mv '${DEST}/mariadb.sql.tmp' '${DEST}/mariadb.sql'
+    chmod 600 '${DEST}/mariadb.sql'
+" </dev/null

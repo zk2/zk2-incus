@@ -17,9 +17,8 @@
 # ZFS, a disk that failed while the pool still said ONLINE, an instance
 # without a memory limit, a port opened by hand.
 #
-# Checks for other parts of zk2 (backup inventory, leftover snapshots,
-# backup storage space, VPN routes, monitoring) join this file together with
-# those parts.
+# Checks for other parts of zk2 (VPN routes, monitoring) join this file
+# together with those parts.
 #
 # Settings, all optional, in node.conf:
 #   ZFS_POOL       pool that must exist (all pools are checked regardless)
@@ -67,7 +66,8 @@ PUBLISH="$(dirname "$(readlink -f "$0")")/zk2-publish"
 findings=""
 add() { findings+="$1"$'\n'; }
 
-instances=$(incus query "/1.0/instances?recursion=1" </dev/null)
+# recursion=2: only then does each instance carry its snapshots and state.
+instances=$(incus query "/1.0/instances?recursion=2" </dev/null)
 
 # --------------------------------------------------------------------------
 # Instances that should start on their own but are down
@@ -324,6 +324,50 @@ if zk2_ct_running "$VPN_CT"; then
         </dev/null >/dev/null 2>&1 \
         || add "VPN: crl.pem is not readable by nobody - client revocation DOES NOT WORK"
 fi
+
+# --------------------------------------------------------------------------
+# Backup inventory
+#
+# A new instance must not end up outside the backup without anyone noticing;
+# todo means "not decided" and is a finding, not a state. Temporary instances
+# marked user.zk2.ephemeral (set by whoever creates and removes them) are
+# exempt. A name listed twice breaks nothing loudly: the backup archives it
+# twice a night and reports success.
+# --------------------------------------------------------------------------
+
+INVENTORY=${ZK2_INVENTORY:-${ZK2_CONF_DIR}/inventory.conf}
+if [ -r "$INVENTORY" ]; then
+    inv=$(grep -vE '^[[:space:]]*(#|$)' "$INVENTORY" || true)
+    inv_names=$(awk '{ print $1 }' <<<"$inv" | sort)
+    node_names=$(jq -r '.[] | select((.config["user.zk2.ephemeral"] // "") == "") | .name' <<<"$instances" | sort)
+    while IFS= read -r n; do
+        add "instance ${n}: not in ${INVENTORY}"
+    done < <(comm -23 <(printf '%s\n' "$node_names" | sed '/^$/d') <(sort -u <<<"$inv_names" | sed '/^$/d'))
+    while IFS= read -r n; do
+        add "instance ${n}: in the inventory, but not on the node"
+    done < <(comm -13 <(printf '%s\n' "$node_names" | sed '/^$/d') <(sort -u <<<"$inv_names" | sed '/^$/d'))
+    while read -r n policy _; do
+        [ "$policy" = todo ] && add "instance ${n}: backup policy not chosen (todo)"
+    done <<<"$inv"
+    dups=$(uniq -d <<<"$inv_names" | tr '\n' ' ')
+    [ -z "${dups// /}" ] || add "inventory: listed more than once: ${dups}"
+else
+    add "no ${INVENTORY} - backup coverage not checked"
+fi
+
+# --------------------------------------------------------------------------
+# Leftover backup snapshots
+#
+# A snapshot left by a failed backup holds space and grows with every change
+# of the instance. zk2-backup names its snapshots zk2-<stamp>. Run this check
+# after the backup, never alongside it (zk2-nightly keeps the order), or the
+# working snapshot of a running backup shows up here.
+# --------------------------------------------------------------------------
+
+while IFS=$'\t' read -r ct snap; do
+    add "instance ${ct}: snapshot ${snap} left by a backup run - remove it"
+done < <(jq -r '.[] | .name as $n | (.snapshots // [])[] | select(.name | startswith("zk2-"))
+                | [$n, .name] | @tsv' <<<"$instances")
 
 # --------------------------------------------------------------------------
 # Publication versus git

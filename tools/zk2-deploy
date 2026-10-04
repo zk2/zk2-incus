@@ -19,12 +19,17 @@
 # On the node:
 #
 #   /opt/zk2/bin            zk2 commands, replaced as a whole on every deploy
+#   /opt/zk2/hooks          generic pre-backup hooks, the same way
 #   /opt/zk2/VERSION        git describe of the zk2 checkout that was deployed
 #   /usr/local/sbin/zk2-*   symlinks to /opt/zk2/bin, so the commands are in PATH
 #   /etc/zk2/node.conf      from nodes/<NODE>/node.conf
 #   /etc/zk2/publication/   from nodes/<NODE>/publication/, mirrored
+#   /etc/zk2/inventory.conf from nodes/<NODE>/inventory.conf (backup)
+#   /etc/zk2/restore.conf   from nodes/<NODE>/restore.conf (restore map)
+#   /etc/zk2/hooks/         from nodes/<NODE>/hooks/, mirrored (your hooks)
+#   /etc/zk2/zk2-env.dist   template of the secrets file
 #   /etc/zk2/zk2-env        secrets: NEVER written by this script, create it
-#                           on the node by hand, mode 600
+#                           on the node from the template, mode 600
 #
 # The node is reached by SSH_HOST from its node.conf, or by its name when
 # SSH_HOST is not set. Log in as root; rsync must be installed on the node.
@@ -153,6 +158,9 @@ deploy_node() {
     # removed from zk2 must not keep running on the node from an old deploy.
     "${RSYNC[@]}" --delete --chmod=D755,F755 \
         "${ZK2_HOME}/bin/" "${NODE}:${R_OPT}/bin/"
+    rmkdir "${R_OPT}/hooks"
+    "${RSYNC[@]}" --delete --chmod=D755,F755 --exclude README.md \
+        "${ZK2_HOME}/hooks/" "${NODE}:${R_OPT}/hooks/"
 
     say
     say "== data -> ${R_ETC}"
@@ -165,6 +173,23 @@ deploy_node() {
         "${RSYNC[@]}" --delete --chmod=D755,F644 \
             "${NODE_DIR}/publication/" "${NODE}:${R_ETC}/publication/"
     fi
+    local f
+    for f in inventory.conf restore.conf; do
+        if [ -r "${NODE_DIR}/${f}" ]; then
+            "${RSYNC[@]}" --chmod=F644 "${NODE_DIR}/${f}" "${NODE}:${R_ETC}/${f}"
+        else
+            say "note: no nodes/${NODE_NAME}/${f}"
+        fi
+    done
+    # Your hooks are mirrored as well: a hook removed from git must not keep
+    # running from an old deploy. Executable, because they are run directly.
+    if [ -d "${NODE_DIR}/hooks" ]; then
+        "${RSYNC[@]}" --delete --chmod=D755,F755 \
+            "${NODE_DIR}/hooks/" "${NODE}:${R_ETC}/hooks/"
+    fi
+    # The template goes next to the real file under another name, so it can
+    # never overwrite it.
+    "${RSYNC[@]}" --chmod=F644 "${ZK2_HOME}/examples/zk2-env.dist" "${NODE}:${R_ETC}/zk2-env.dist"
 
     [ "$DRY_RUN" = 1 ] && { say; say "(links, VERSION and checks skipped)"; return 0; }
 
@@ -199,7 +224,7 @@ deploy_node() {
             m=\$(stat -c %a $(q "${R_ETC}/zk2-env"))
             [ \"\$m\" = 600 ] && echo '  zk2-env: present' || echo \"  zk2-env: present, mode \$m - should be 600\"
         else
-            echo '  zk2-env: missing - tools that need secrets will refuse to run'
+            echo '  zk2-env: missing - create it from zk2-env.dist; tools that need secrets refuse to run'
         fi"
 }
 

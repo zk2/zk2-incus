@@ -106,11 +106,26 @@ above (or `ZK2_FLEET`).
 | Path | What | Written by |
 |---|---|---|
 | `/opt/zk2/bin/` | zk2 commands | `zk2-deploy`, replaced as a whole |
+| `/opt/zk2/hooks/` | generic pre-backup hooks | `zk2-deploy`, replaced as a whole |
 | `/opt/zk2/VERSION` | which zk2 is deployed | `zk2-deploy` |
 | `/usr/local/sbin/zk2-*` | links to `/opt/zk2/bin`, so commands are in `PATH` | `zk2-deploy` |
 | `/etc/zk2/node.conf` | node parameters | `zk2-deploy`, from your fleet |
 | `/etc/zk2/publication/` | published ports and ACLs | `zk2-deploy`, mirrored from your fleet |
-| `/etc/zk2/zk2-env` | secrets: borg passphrase, mail credentials | **you**, by hand, mode 600; never in git, never overwritten |
+| `/etc/zk2/inventory.conf` | what is backed up, how often, with which hook | `zk2-deploy`, from your fleet |
+| `/etc/zk2/hooks/` | your own pre-backup hooks | `zk2-deploy`, mirrored from your fleet |
+| `/etc/zk2/zk2-env.dist` | template of the secrets file | `zk2-deploy` |
+| `/etc/zk2/zk2-env` | secrets: borg repository and passphrase, report address | **you**, from the template, mode 600; never in git, never overwritten |
+
+Once per node, after the first deploy, on the node:
+
+```sh
+cp /etc/zk2/zk2-env.dist /etc/zk2/zk2-env && chmod 600 /etc/zk2/zk2-env
+editor /etc/zk2/zk2-env                  # BORG_REPO, BORG_PASSPHRASE, ZK2_EMAIL
+(set -a; . /etc/zk2/zk2-env; borg init --encryption=repokey-blake2)
+```
+
+Keep the passphrase and `borg key export --paper` outside the node: without
+them no archive can be read.
 
 Nightly report on the node, mailed to `ZK2_EMAIL` from `zk2-env` through
 any of sendmail, msmtp or ssmtp. By default it comes every night, "OK" or
@@ -118,9 +133,13 @@ any of sendmail, msmtp or ssmtp. By default it comes every night, "OK" or
 `MAIL_WHEN=problems` in `node.conf` limits it to nights with findings.
 
 ```
-# /etc/cron.d/zk2
+# /etc/cron.d/zk2 - until zk2-nightly runs both in order
+0 3 * * * root /usr/local/sbin/zk2-backup --mail
 30 5 * * * root /usr/local/sbin/zk2-health --mail
 ```
+
+Keep health well after the backup: run alongside it, it reports the
+working snapshot of the backup as left over.
 
 Log in as root over ssh; the node needs `rsync`. The ssh alias is the node
 directory name unless `SSH_HOST` in `node.conf` says otherwise.
@@ -131,7 +150,8 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 |---|---|---|
 | `zk2-deploy` | workstation | deliver code and node data; deploy a container role |
 | `zk2-fleet` | workstation | create a fleet, add a node from the example |
-| `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, publication drift |
+| `zk2-backup` | node | snapshot, read-only mount, borg: containers, VMs (files, or whole on the monthly policy), pre-backup database dumps, per-instance retention |
+| `zk2-health` | node | what differs from how the node is meant to be: kernel without ZFS module, pool devices, memory limits and OOM kills, instances without limits, certificates, backup inventory, leftover snapshots, publication drift |
 | `zk2-publish` | node | published ports (Incus network forwards) and ACLs from git: `diff`, `apply`, `show` |
 | `zk2-idmap` | node | container uid isolation and pipe usage per host uid |
 
@@ -141,7 +161,7 @@ directory name unless `SSH_HOST` in `node.conf` says otherwise.
 |---|---|
 | `bin/` | node tools, installed to `/opt/zk2/bin`: build, new container, publish, backup, restore, health, nightly run |
 | `cloud-init/` | the base profile for new instances |
-| `hooks/` | pre-backup database dumps (examples for PostgreSQL and MariaDB) |
+| `hooks/` | pre-backup database dumps: PostgreSQL, MariaDB, PostgreSQL in docker, GitLab |
 | `containers/` | nginx front and OpenVPN gateway: configs and helper scripts |
 | `zabbix/` | optional monitoring: agent installer, templates, dashboard as code |
 | `tools/` | workstation tools: deploy to a node, check all vhosts, OpenVPN client control |

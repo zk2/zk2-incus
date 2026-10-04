@@ -1,0 +1,38 @@
+#!/bin/bash
+#
+# Dump the database of an omnibus GitLab inside an instance before backup.
+#
+# Usage: dump-gitlab INSTANCE
+#
+# Not "gitlab-backup create": it copies repositories and artifacts next to
+# themselves, doubling the space they take and running for hours, while the
+# snapshot carries them anyway. Only the database gets a logical dump here.
+#
+# The dump is useless without /etc/gitlab/gitlab-secrets.json: CI variables,
+# tokens and 2FA secrets are encrypted with keys from it. The file travels in
+# the snapshot; remember it when restoring from the dump alone.
+#
+# pg_dump runs as gitlab-psql over the bundled server's socket (peer
+# authentication), so no password is stored. See README.md for the rules
+# every hook follows.
+
+set -euo pipefail
+
+CT=${1:?usage: $(basename "$0") INSTANCE}
+DEST=${DEST:-/var/backups/zk2}
+
+if ! incus exec "$CT" -- test -x /opt/gitlab/embedded/bin/pg_dump </dev/null 2>/dev/null; then
+    echo "${CT}: no /opt/gitlab/embedded/bin/pg_dump - not an omnibus GitLab" >&2
+    exit 1
+fi
+
+# su -s /bin/sh: gitlab-psql may have nologin as its shell.
+incus exec "$CT" -- sh -c "
+    set -e
+    mkdir -p '${DEST}' && chmod 700 '${DEST}'
+    su -s /bin/sh gitlab-psql -c \
+        '/opt/gitlab/embedded/bin/pg_dump -h /var/opt/gitlab/postgresql -d gitlabhq_production' \
+        > '${DEST}/gitlab.sql.tmp'
+    mv '${DEST}/gitlab.sql.tmp' '${DEST}/gitlab.sql'
+    chmod 600 '${DEST}/gitlab.sql'
+" </dev/null

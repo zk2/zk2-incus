@@ -1,0 +1,434 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR
+#
+# Back up instances: snapshot -> read-only mount -> borg.
+#
+# Usage: zk2-backup [--dry-run] [--mail] [--only NAME[,NAME...]]
+#   --dry-run   say what would be archived, archive nothing
+#   --mail      mail the report (MAIL_WHEN in node.conf decides when)
+#   --only      only these instances, whatever their policy says
+#
+# No downtime: a ZFS snapshot is instant, and borg reads the frozen copy.
+# The data is crash-consistent, like after a power cut: PostgreSQL and InnoDB
+# replay their journal on start. Pre-backup hooks add logical dumps on top.
+#
+# What is backed up is decided by /etc/zk2/inventory.conf, not by a tag on the
+# instance: a tag is easy to put on the wrong instance, and impossible to
+# notice when a new instance has none.
+#
+# Containers are archived from their snapshot directly. VMs have a block
+# volume instead of a file tree: the snapshot is cloned as a volume, its
+# partition table read, the root partition mounted read-only. A VM on the
+# monthly policy is exported whole instead (incus export), so that it comes
+# back bootable - a file archive of a VM has no kernel and no boot loader.
+#
+# Archives are named NAME@YYYY-MM-DDTHHMM. "@" because instance names may
+# contain dashes and pruning by "web-" would also hit "web-db"; Incus does not
+# allow "@" in names, so "web@" is unambiguous.
+#
+# Settings in node.conf (defaults in brackets): KEEP_DAILY [7], KEEP_WEEKLY [4],
+# KEEP_MONTHLY [6], WEEKLY_DAY [7], MONTHLY_DAYS [30], MONTHLY_KEEP [2],
+# EXPORT_TMP [/var/tmp]. Secrets in zk2-env: BORG_REPO, BORG_PASSPHRASE,
+# BORG_RSH (optional).
+#
+# Only instances of the default Incus project on ZFS storage pools.
+
+# shellcheck source=zk2-lib
+. "$(dirname "$(readlink -f "$0")")/zk2-lib"
+zk2_require_root
+zk2_require_cmd incus jq borg flock mount umount zfs
+
+DRY_RUN=0; MAIL=0; ONLY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        --mail)    MAIL=1; shift ;;
+        --only)    ONLY=${2:?--only needs a list of names}; shift 2 ;;
+        -h|--help) sed -n '4,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) zk2_die "unknown option: $1" ;;
+    esac
+done
+
+zk2_load_node
+# The passphrase sits in zk2-env, mode 600. That is the price of unattended
+# backups: whoever gets root on the node can read the archives.
+zk2_load_env BORG_REPO BORG_PASSPHRASE
+export BORG_REPO BORG_PASSPHRASE
+# An empty BORG_RSH would be taken as an empty ssh command.
+[ -z "${BORG_RSH:-}" ] || export BORG_RSH
+
+INVENTORY=${ZK2_INVENTORY:-${ZK2_CONF_DIR}/inventory.conf}
+HOOK_DIRS=("${ZK2_CONF_DIR}/hooks" "$(dirname "$(readlink -f "$0")")/../hooks")
+KEEP_DAILY=${KEEP_DAILY:-7}
+KEEP_WEEKLY=${KEEP_WEEKLY:-4}
+KEEP_MONTHLY=${KEEP_MONTHLY:-6}
+WEEKLY_DAY=${WEEKLY_DAY:-7}
+MONTHLY_DAYS=${MONTHLY_DAYS:-30}
+MONTHLY_KEEP=${MONTHLY_KEEP:-2}
+EXPORT_TMP=${EXPORT_TMP:-/var/tmp}
+# Where snapshots are mounted while borg reads them.
+RUN_DIR=${ZK2_RUN_DIR:-/run/zk2-backup}
+NODE_NAME=${NODE_NAME:-$(hostname -s)}
+MAIL_WHEN=${MAIL_WHEN:-always}
+
+[ -r "$INVENTORY" ] || zk2_die "no ${INVENTORY}"
+
+# Two runs at once would fight over the repository lock and leave snapshots.
+mkdir -p /run/lock
+exec 9>/run/lock/zk2-backup.lock
+flock -n 9 || zk2_die "a backup run is already in progress"
+
+STAMP=$(date +%FT%H%M)
+STARTED=$(date '+%F %T')
+REPORT=""; FAILED=0; DONE=0
+
+report() { REPORT+="$1"$'\n'; }
+
+instances=$(incus query "/1.0/instances?recursion=1" </dev/null)
+inst() { jq -r --arg n "$1" ".[] | select(.name == \$n) | $2" <<<"$instances"; }
+
+# --------------------------------------------------------------------------
+# Where an instance lives in ZFS
+# --------------------------------------------------------------------------
+
+# The dataset is asked from Incus, not assembled from a pool name in config:
+# the instance's root device names the storage pool, and the pool's
+# zfs.pool_name names the ZFS dataset under which Incus keeps it ("tank",
+# "tank/incus", ...). Anything but the zfs driver is refused by name.
+zfs_root_of() {
+    local pool driver root
+    pool=$(inst "$1" '.expanded_devices.root.pool // empty')
+    [ -n "$pool" ] || { echo "no root disk pool"; return 1; }
+    read -r driver root < <(incus query "/1.0/storage-pools/${pool}" </dev/null \
+        | jq -r '[.driver, (.config["zfs.pool_name"] // .name)] | @tsv' | tr '\t' ' ') || true
+    [ "$driver" = zfs ] || { echo "storage pool ${pool} uses ${driver:-?}, only zfs is supported"; return 1; }
+    echo "$root"
+}
+
+# --------------------------------------------------------------------------
+# Hooks
+# --------------------------------------------------------------------------
+
+run_hook() {
+    local ct=$1 hook=$2 d
+    [ -n "$hook" ] && [ "$hook" != "-" ] || return 0
+    for d in "${HOOK_DIRS[@]}"; do
+        if [ -x "${d}/${hook}" ]; then
+            "${d}/${hook}" "$ct" </dev/null >/dev/null 2>&1 \
+                || { report "  ${ct}: hook ${hook} FAILED"; return 1; }
+            return 0
+        fi
+    done
+    report "  ${ct}: hook ${hook} NOT FOUND in ${HOOK_DIRS[*]}"
+    return 1
+}
+
+# borg_create NAME WHAT T0 DIR [borg options] - archive DIR. Paths in the
+# archive are relative, so a restore unpacks straight into the root of a new
+# instance. Only borg itself runs in a subshell (for the cd); the report line
+# and the counter stay in this shell.
+#
+# --numeric-ids: user names may map to other uids on the restoring side.
+#
+# NO --exclude-caches, on purpose. It skips directories with a CACHEDIR.TAG,
+# and "python -m venv" puts one into EVERY virtual environment since Python
+# 3.11. borg dropped every venv, tag included, nightly backups reported
+# success for months, and restored applications failed with "no such file
+# .../venv/bin/python". Real caches cost some space; an environment that
+# cannot be restored costs the restore.
+borg_create() {
+    local ct=$1 what=$2 t0=$3 dir=$4 stats size
+    shift 4
+    if stats=$(cd "$dir" && borg create --stats --compression zstd "$@" "::${ct}@${STAMP}" . 2>&1); then
+        # Three numbers in --stats: original, compressed, deduplicated. The
+        # third is what the repository actually grows by.
+        size=$(awk '/^This archive:/ { printf "%s %s, %s %s new in the repository", $3, $4, $7, $8 }' <<<"$stats")
+        report "  ${ct}: ok${what}, ${size:-?}, $(( $(date +%s) - t0 )) s"
+        DONE=$(( DONE + 1 ))
+        return 0
+    fi
+    report "  ${ct}: BORG FAILED: $(tail -2 <<<"$stats" | tr '\n' ' ')"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# One container
+# --------------------------------------------------------------------------
+
+backup_ct() {
+    local ct=$1 hook=$2 root snap mnt t0 rc=0 snapped=0 mounted=0
+    snap="zk2-${STAMP}"
+    mnt="${RUN_DIR}/${ct}"
+
+    root=$(zfs_root_of "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    [ "$DRY_RUN" = 1 ] && { report "  ${ct}: would archive ${ct}@${STAMP}"; return 0; }
+
+    # Cleanup runs whatever happens: a forgotten snapshot holds space and
+    # grows with every change of the instance.
+    cleanup() {
+        [ "$mounted" = 1 ] && { umount "$mnt" 2>/dev/null || report "  ${ct}: could not unmount ${mnt}"; }
+        [ "$snapped" = 1 ] && { incus snapshot delete "$ct" "$snap" </dev/null >/dev/null 2>&1 \
+            || report "  ${ct}: snapshot ${snap} NOT DELETED, remove it by hand"; }
+        rmdir "$mnt" 2>/dev/null || true
+    }
+
+    t0=$(date +%s)
+    run_hook "$ct" "$hook" || rc=1
+
+    # </dev/null is not decoration: the Incus client waits for the end of
+    # stdin before it talks to the daemon. Run over ssh without a terminal,
+    # stdin is an open pipe, and the command hangs forever - with nothing in
+    # the daemon log. From cron it never shows, because stdin is /dev/null
+    # there: the nightly run works and a manual run over ssh does not.
+    if ! incus snapshot create "$ct" "$snap" </dev/null >/dev/null 2>&1; then
+        report "  ${ct}: FAILED, snapshot not created"
+        return 1
+    fi
+    snapped=1
+
+    # A ZFS snapshot is a dataset, not a directory tree: it has to be mounted.
+    # Incus names the dataset snapshot "snapshot-<name>".
+    mkdir -p "$mnt"
+    if ! mount -t zfs -o ro "${root}/containers/${ct}@snapshot-${snap}" "$mnt" 2>/dev/null; then
+        cleanup; report "  ${ct}: FAILED, snapshot not mounted"; return 1
+    fi
+    mounted=1
+    [ -d "${mnt}/rootfs" ] || { cleanup; report "  ${ct}: FAILED, no rootfs in the snapshot"; return 1; }
+
+    borg_create "$ct" "" "$t0" "${mnt}/rootfs" --numeric-ids || rc=1
+    cleanup
+    return $rc
+}
+
+# --------------------------------------------------------------------------
+# One VM, file level
+# --------------------------------------------------------------------------
+#
+# snapshot -> clone of the snapshot as a volume -> partition table -> root
+# partition mounted read-only -> borg -> cleanup.
+#
+# A clone, not the snapshot itself: a zvol snapshot has no device without
+# snapdev, and its partitions are not scanned anyway. The clone is
+# copy-on-write and lives for seconds.
+#
+# volmode=full is required: Incus volumes default to volmode=none (no device
+# on the host at all), and "dev" gives a device WITHOUT partition scanning.
+backup_vm() {
+    local ct=$1 root snap clone dev part fstype mnt t0 mopts rc=0 snapped=0 cloned=0 mounted=0
+    snap="zk2-${STAMP}"
+    mnt="${RUN_DIR}/${ct}"
+
+    root=$(zfs_root_of "$ct") || { report "  ${ct}: FAILED, ${root}"; return 1; }
+    clone="${root}/zk2-vmbackup-${ct}"
+    dev="/dev/zvol/${clone}"
+    [ "$DRY_RUN" = 1 ] && { report "  ${ct}: VM, would archive ${ct}@${STAMP}"; return 0; }
+
+    # The clone holds the snapshot: it goes first.
+    cleanup() {
+        [ "$mounted" = 1 ] && { umount "$mnt" 2>/dev/null || report "  ${ct}: could not unmount ${mnt}"; }
+        [ "$cloned" = 1 ]  && { zfs destroy "$clone" 2>/dev/null \
+            || report "  ${ct}: clone ${clone} NOT DESTROYED, remove it by hand"; }
+        [ "$snapped" = 1 ] && { incus snapshot delete "$ct" "$snap" </dev/null >/dev/null 2>&1 \
+            || report "  ${ct}: snapshot ${snap} NOT DELETED, remove it by hand"; }
+        rmdir "$mnt" 2>/dev/null || true
+    }
+
+    t0=$(date +%s)
+    incus snapshot create "$ct" "$snap" </dev/null >/dev/null 2>&1 \
+        || { report "  ${ct}: FAILED, snapshot not created"; return 1; }
+    snapped=1
+    zfs clone -o volmode=full "${root}/virtual-machines/${ct}.block@snapshot-${snap}" "$clone" 2>/dev/null \
+        || { cleanup; report "  ${ct}: FAILED, snapshot not cloned"; return 1; }
+    cloned=1
+    udevadm settle 2>/dev/null || true
+    partx -u "$dev" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+
+    # The root partition is searched for, not assumed to be the second: the
+    # largest partition with a Linux file system. EFI is small and vfat.
+    part=$(lsblk -nrpo NAME,FSTYPE,SIZE "$dev" 2>/dev/null \
+           | awk '$2 ~ /^(ext[234]|xfs|btrfs)$/ { print $3, $1 }' | sort -h | tail -1 | awk '{ print $2 }')
+    [ -n "$part" ] || { cleanup; report "  ${ct}: FAILED, no partition with a Linux file system"; return 1; }
+    fstype=$(lsblk -nrpo FSTYPE "$part" 2>/dev/null | head -1)
+
+    # The journal is NOT replayed: the snapshot is crash-consistent, and a
+    # replay on a read-only device would refuse to mount.
+    case "$fstype" in
+        ext[234]) mopts="ro,noload" ;;
+        xfs)      mopts="ro,norecovery" ;;
+        *)        mopts="ro" ;;
+    esac
+    mkdir -p "$mnt"
+    mount -o "$mopts" "$part" "$mnt" 2>/dev/null \
+        || { cleanup; report "  ${ct}: FAILED, ${part} (${fstype:-?}) not mounted"; return 1; }
+    mounted=1
+
+    borg_create "$ct" " (VM, files)" "$t0" "$mnt" --numeric-ids || rc=1
+    cleanup
+    return $rc
+}
+
+# --------------------------------------------------------------------------
+# One VM, whole (monthly policy)
+# --------------------------------------------------------------------------
+#
+# incus export without compression into a temporary tar, then borg: borg
+# deduplicates the raw disk far better than it could a compressed stream.
+# Restore: incus import of the tar extracted from the archive.
+export_vm() {
+    local ct=$1 tmp need avail t0 rc=0
+    [ "$DRY_RUN" = 1 ] && { report "  ${ct}: VM on monthly, would export whole to ${ct}@${STAMP}"; return 0; }
+
+    # The export writes the whole disk, zeros included. Check space first, or
+    # it dies halfway and leaves a fragment behind.
+    need=$(numfmt --from=auto "$(inst "$ct" '.expanded_devices.root.size // "20GiB"' | sed 's/B$//')" 2>/dev/null || echo 0)
+    avail=$(df -B1 --output=avail "$EXPORT_TMP" 2>/dev/null | tail -1 | tr -d ' ')
+    if [ -n "$avail" ] && [ "$need" -gt 0 ] && [ "$avail" -lt $(( need + 2 * 1024 * 1024 * 1024 )) ]; then
+        report "  ${ct}: FAILED, ${EXPORT_TMP} has $(numfmt --to=iec "$avail") free, about $(numfmt --to=iec $(( need + 2 * 1024 * 1024 * 1024 ))) needed"
+        return 1
+    fi
+
+    t0=$(date +%s)
+    tmp=$(mktemp -d "${EXPORT_TMP}/zk2-export.XXXXXX")
+    if ! incus export "$ct" "${tmp}/${ct}.tar" --instance-only --compression none </dev/null >/dev/null 2>&1; then
+        rm -rf "$tmp"; report "  ${ct}: FAILED, incus export"; return 1
+    fi
+    borg_create "$ct" " (VM, whole)" "$t0" "$tmp" || rc=1
+    rm -rf "$tmp"
+    return $rc
+}
+
+# --------------------------------------------------------------------------
+# Walk the inventory
+# --------------------------------------------------------------------------
+#
+# Read into memory BEFORE the walk. A loop reading the file from stdin, with
+# a hook or "incus exec" inside that reads stdin too, loses the rest of the
+# file: the backup handles two instances out of seven and reports success,
+# because for the loop the file simply ended.
+
+mapfile -t INV < <(grep -vE '^[[:space:]]*(#|$)' "$INVENTORY")
+today=$(date +%u)
+
+# Age of the newest archive per instance, for the monthly policy. By AGE, not
+# by day of month: a missed night does not push the archive a month ahead,
+# and a manual --only run restarts the count. Checkpoints (unfinished runs)
+# do not count. If the list cannot be read, every monthly instance is due:
+# a run that fails loudly beats a silent skip.
+ARCH_TIMES=""
+if printf '%s\n' "${INV[@]}" | awk '$2 == "monthly" { f = 1 } END { exit !f }'; then
+    ARCH_TIMES=$(borg list --format '{archive}{TAB}{time:%s}{NL}' 2>/dev/null | grep -v '\.checkpoint' || true)
+fi
+monthly_due() {
+    local last
+    last=$(awk -F'\t' -v p="${1}@" 'index($1, p) == 1 { print $2 }' <<<"$ARCH_TIMES" | sort -n | tail -1)
+    [ -z "$last" ] || [ $(( $(date +%s) - last )) -ge $(( MONTHLY_DAYS * 86400 )) ]
+}
+
+skipped_todo=""; ONLY_SEEN=""; EXPECTED=0
+
+for line in "${INV[@]}"; do
+    read -r ct policy hook _ <<<"$line"
+
+    if [ -n "$ONLY" ]; then
+        case ",${ONLY}," in *",${ct},"*) ONLY_SEEN+="${ct} " ;; *) continue ;; esac
+    fi
+
+    # --only beats the policy: it is an explicit order about one instance.
+    # Otherwise "--only NAME" on a none, todo or off-day weekly instance would
+    # quietly do nothing and report success - typically right before someone
+    # deletes the instance trusting that last archive.
+    case "${policy:-}" in
+        daily) ;;
+        weekly)  [ "$today" = "$WEEKLY_DAY" ] || [ -n "$ONLY" ] || continue ;;
+        monthly) [ -n "$ONLY" ] || monthly_due "$ct" || continue ;;
+        none)    [ -n "$ONLY" ] || continue ;;
+        todo)    [ -n "$ONLY" ] || { skipped_todo+="${ct} "; continue; } ;;
+        *) report "  ${ct}: UNKNOWN POLICY '${policy:-}', skipped"; FAILED=$(( FAILED + 1 )); continue ;;
+    esac
+
+    # Counted BEFORE the existence check: a listed instance that vanished is
+    # expected work not done, not "less work".
+    EXPECTED=$(( EXPECTED + 1 ))
+    type=$(inst "$ct" '.type')
+    if [ -z "$type" ]; then
+        report "  ${ct}: NO SUCH INSTANCE"
+        FAILED=$(( FAILED + 1 ))
+        continue
+    fi
+
+    ok=1
+    if [ "$type" = virtual-machine ]; then
+        [ "${hook:--}" = "-" ] || report "  ${ct}: hook ${hook} skipped - incus exec does not reach into a VM"
+        if [ "$policy" = monthly ]; then export_vm "$ct" || ok=0
+        else backup_vm "$ct" || ok=0
+        fi
+    else
+        backup_ct "$ct" "${hook:--}" || ok=0
+    fi
+    [ "$ok" = 1 ] || FAILED=$(( FAILED + 1 ))
+
+    # Monthly is pruned right after a successful archive, also under --only
+    # (a manual run is one of the two ways to refresh it). Never after a
+    # failure: a failed run must not cost the previous copy.
+    if [ "$policy" = monthly ] && [ "$ok" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+        borg prune --glob-archives "${ct}@*" --keep-last="$MONTHLY_KEEP" >/dev/null 2>&1 \
+            || report "  prune ${ct}: FAILED"
+    fi
+done
+
+# --------------------------------------------------------------------------
+# Pruning, per instance: borg would otherwise count the archives of all
+# instances together and keep too much of some and too little of others.
+# --------------------------------------------------------------------------
+
+if [ "$DRY_RUN" = 0 ] && [ -z "$ONLY" ]; then
+    for line in "${INV[@]}"; do
+        read -r ct policy _ <<<"$line"
+        case "$policy" in daily|weekly) ;; *) continue ;; esac
+        borg prune --glob-archives "${ct}@*" --keep-daily="$KEEP_DAILY" \
+            --keep-weekly="$KEEP_WEEKLY" --keep-monthly="$KEEP_MONTHLY" >/dev/null 2>&1 \
+            || report "  prune ${ct}: FAILED"
+    done
+    # Pruning only marks space as free; compact returns it (borg 1.2+).
+    borg compact >/dev/null 2>&1 || report "  borg compact: FAILED"
+fi
+
+# --------------------------------------------------------------------------
+# Cross-checks and report
+# --------------------------------------------------------------------------
+
+[ -z "$skipped_todo" ] || report "UNPROTECTED (policy todo): ${skipped_todo}"
+
+# A name in --only that is not in the inventory would otherwise do nothing
+# and report success - and the operator walks away sure the archive exists.
+if [ -n "$ONLY" ]; then
+    for want in ${ONLY//,/ }; do
+        case " ${ONLY_SEEN}" in *" ${want} "*) continue ;; esac
+        report "  ${want}: NOT IN ${INVENTORY} - nothing done"
+        FAILED=$(( FAILED + 1 ))
+    done
+fi
+
+# An instance missing from the inventory stays without backup and nobody
+# notices. Temporary instances marked user.zk2.ephemeral are exempt.
+while read -r name; do
+    printf '%s\n' "${INV[@]}" | awk -v n="$name" '$1 == n { f = 1 } END { exit !f }' \
+        || report "NOT IN INVENTORY: ${name}"
+done < <(jq -r '.[] | select((.config["user.zk2.ephemeral"] // "") == "") | .name' <<<"$instances")
+
+# Last line of defence: any future way to cut the walk short silently runs
+# into this comparison.
+if [ "$DRY_RUN" = 0 ] && [ $(( DONE + FAILED )) -lt "$EXPECTED" ]; then
+    report "WALK CUT SHORT: expected ${EXPECTED}, handled $(( DONE + FAILED ))"
+    FAILED=$(( FAILED + 1 ))
+fi
+
+OUT=$(printf 'Backup %s: %s - %s, ok %s, failed %s\n\n%s' "$NODE_NAME" "$STARTED" \
+      "$(date '+%F %T')" "$DONE" "$FAILED" "$REPORT")
+printf '%s\n' "$OUT"
+
+if [ "$MAIL" = 1 ] && [ "$DRY_RUN" = 0 ] && { [ "$FAILED" != 0 ] || [ "$MAIL_WHEN" != problems ]; }; then
+    zk2_mail "${NODE_NAME}: backup $([ "$FAILED" = 0 ] && echo ok || echo FAILED)" <<<"$OUT" || true
+fi
+[ "$FAILED" = 0 ]

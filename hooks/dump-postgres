@@ -1,0 +1,31 @@
+#!/bin/bash
+#
+# Dump all PostgreSQL databases and roles inside an instance before backup.
+#
+# Usage: dump-postgres INSTANCE
+#
+# pg_dumpall, not pg_dump: roles and grants are not part of a per-database
+# dump, and without them a restored database has owners that do not exist.
+# Runs as the postgres system user over the local socket (peer
+# authentication), so no password is stored anywhere. See README.md for the
+# rules every hook follows.
+
+set -euo pipefail
+
+CT=${1:?usage: $(basename "$0") INSTANCE}
+DEST=${DEST:-/var/backups/zk2}
+
+if ! incus exec "$CT" -- sh -c 'command -v pg_dumpall' </dev/null >/dev/null 2>&1; then
+    echo "${CT}: no pg_dumpall in the instance - is PostgreSQL installed there?" >&2
+    exit 1
+fi
+
+# su -s /bin/sh: the postgres user may have nologin as its shell, and a plain
+# "su postgres" would then quietly run nothing.
+incus exec "$CT" -- sh -c "
+    set -e
+    mkdir -p '${DEST}' && chmod 700 '${DEST}'
+    su -s /bin/sh postgres -c 'pg_dumpall' > '${DEST}/postgres.sql.tmp'
+    mv '${DEST}/postgres.sql.tmp' '${DEST}/postgres.sql'
+    chmod 600 '${DEST}/postgres.sql'
+" </dev/null
