@@ -28,7 +28,7 @@
 #
 # Settings in node.conf (defaults in brackets): KEEP_DAILY [7], KEEP_WEEKLY [4],
 # KEEP_MONTHLY [6], WEEKLY_DAY [7], MONTHLY_DAYS [30], MONTHLY_KEEP [2],
-# EXPORT_TMP [/var/tmp]. Secrets in zk2-env: BORG_REPO, BORG_PASSPHRASE,
+# EXPORT_TMP [/var/tmp], BORG_COMPACT [yes]. Secrets in zk2-env: BORG_REPO, BORG_PASSPHRASE,
 # BORG_RSH (optional).
 #
 # Only instances of the default Incus project on ZFS storage pools.
@@ -66,6 +66,7 @@ WEEKLY_DAY=${WEEKLY_DAY:-7}
 MONTHLY_DAYS=${MONTHLY_DAYS:-30}
 MONTHLY_KEEP=${MONTHLY_KEEP:-2}
 EXPORT_TMP=${EXPORT_TMP:-/var/tmp}
+BORG_COMPACT=${BORG_COMPACT:-yes}
 # Where snapshots are mounted while borg reads them.
 RUN_DIR=${ZK2_RUN_DIR:-/run/zk2-backup}
 NODE_NAME=${NODE_NAME:-$(hostname -s)}
@@ -390,8 +391,14 @@ if [ "$DRY_RUN" = 0 ] && [ -z "$ONLY" ]; then
             --keep-weekly="$KEEP_WEEKLY" --keep-monthly="$KEEP_MONTHLY" >/dev/null 2>&1 \
             || report "  prune ${ct}: FAILED"
     done
-    # Pruning only marks space as free; compact returns it (borg 1.2+).
-    borg compact >/dev/null 2>&1 || report "  borg compact: FAILED"
+    # Since borg 1.2 prune only marks space as free; compact returns it, and
+    # without it the repository never shrinks. The exception is storage with
+    # its own snapshots: compact rewrites segments, every rewritten segment
+    # stays in the provider's snapshots, and they grow by that much. There,
+    # BORG_COMPACT=no and an occasional manual compact can be cheaper.
+    if [ "$BORG_COMPACT" = yes ]; then
+        borg compact >/dev/null 2>&1 || report "  borg compact: FAILED"
+    fi
 fi
 
 # --------------------------------------------------------------------------
