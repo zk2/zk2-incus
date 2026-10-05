@@ -43,7 +43,6 @@ DEEP=0
 case "${1:-}" in
     --deep) DEEP=1 ;;
     "") ;;
-    -h|--help) sed -n '4,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) zk2_die "unknown option: $1" ;;
 esac
 

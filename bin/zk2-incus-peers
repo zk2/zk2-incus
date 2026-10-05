@@ -40,7 +40,6 @@ LISTEN=":${API_PORT}"
 MODE=${1:-diff}
 case "$MODE" in
     diff|apply) ;;
-    -h|--help) sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) zk2_die "unknown mode: ${MODE} (diff or apply)" ;;
 esac
 # incus waits for the end of stdin before talking to the daemon; where input

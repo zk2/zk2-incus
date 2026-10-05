@@ -27,7 +27,6 @@
 zk2_require_cmd borg
 
 MODE=${1:-overview}
-case "$MODE" in -h|--help) sed -n '4,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 zk2_load_node
 zk2_borg_env

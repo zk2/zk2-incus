@@ -43,7 +43,6 @@ DRY_RUN=0
 case "${1:-}" in
     --dry-run) DRY_RUN=1 ;;
     "") ;;
-    -h|--help) sed -n '4,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) zk2_die "unknown option: $1" ;;
 esac
 

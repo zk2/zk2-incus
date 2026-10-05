@@ -12,6 +12,7 @@
 # configs with revoked certificates.
 
 set -uo pipefail
+case "${1:-}" in -h|--help) awk 'NR == 1 { next } /^#/ { if ($0 ~ /^# shellcheck /) next; sub(/^# ?/, ""); if (!s && $0 == "") next; s = 1; print; next } { exit }' "$0"; exit 0 ;; esac
 
 SRV=/etc/openvpn/server
 PKI=/etc/openvpn/easy-rsa/pki

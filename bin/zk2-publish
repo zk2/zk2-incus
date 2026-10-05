@@ -50,7 +50,6 @@ err()  { printf '%s%s%s\n' "$ZK2_RED"    "$*" "$ZK2_NC" >&2; }
 MODE=${1:-diff}
 case "$MODE" in
     diff|apply|show) ;;
-    -h|--help) sed -n '4,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) zk2_die "unknown mode: ${MODE} (diff, apply or show)" ;;
 esac
 

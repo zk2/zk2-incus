@@ -35,7 +35,6 @@ NO_MAIL=0
 case "${1:-}" in
     --no-mail) NO_MAIL=1 ;;
     "") ;;
-    -h|--help) sed -n '4,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) zk2_die "unknown option: $1" ;;
 esac
 

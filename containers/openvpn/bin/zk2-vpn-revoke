@@ -22,6 +22,7 @@
 # at once, restart openvpn-server@server (which drops every client).
 
 set -euo pipefail
+case "${1:-}" in -h|--help) awk 'NR == 1 { next } /^#/ { if ($0 ~ /^# shellcheck /) next; sub(/^# ?/, ""); if (!s && $0 == "") next; s = 1; print; next } { exit }' "$0"; exit 0 ;; esac
 
 SRV=/etc/openvpn/server
 CRL=/etc/openvpn/crl.pem

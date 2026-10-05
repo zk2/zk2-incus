@@ -13,6 +13,20 @@
 
 set -euo pipefail
 
+# --help for every command, BEFORE any check: "must be run as root" or
+# "missing commands: incus" is no answer to someone reading about a command
+# on the workstation. A sourced file sees the caller's arguments. The help
+# text is the header comment of the calling script, from its second line to
+# the first line that is not a comment, shellcheck directives left out - one
+# source, no line numbers to keep in sync.
+zk2_help() {
+    awk 'NR == 1 { next } /^#/ { if ($0 ~ /^# shellcheck /) next; sub(/^# ?/, ""); if (!s && $0 == "") next; s = 1; print; next } { exit }' "$1"
+}
+for _zk2_a in "$@"; do
+    case "$_zk2_a" in -h|--help) zk2_help "$0"; exit 0 ;; esac
+done
+unset _zk2_a
+
 ZK2_RED=$'\033[0;31m'; ZK2_GREEN=$'\033[0;32m'; ZK2_YELLOW=$'\033[1;33m'; ZK2_NC=$'\033[0m'
 
 zk2_log()  { printf '%s %s\n'     "$(date '+%F %T')" "$*" >&2; }
