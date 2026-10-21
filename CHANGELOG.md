@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `zk2-health`: a running instance with an explicit `boot.autostart=false`
+  is now reported - it would not come back after a node reboot. Temporary
+  instances (`user.zk2.ephemeral`) are exempt.
+
 ## v0.1.0 - 2026-10-05
 
 The first release. Every step of the README was run on real nodes, two VMs

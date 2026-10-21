@@ -70,13 +70,27 @@ add() { findings+="$1"$'\n'; }
 instances=$(incus query "/1.0/instances?recursion=2" </dev/null)
 
 # --------------------------------------------------------------------------
-# Instances that should start on their own but are down
+# Autostart against state: should start on their own but are down - and the
+# other way round
 # --------------------------------------------------------------------------
 
 while IFS=$'\t' read -r name status; do
     add "instance ${name}: boot.autostart=true, but it is ${status}"
 done < <(jq -r '.[] | select((.expanded_config["boot.autostart"] // "false") == "true"
                              and .status != "Running") | [.name, .status] | @tsv' <<<"$instances")
+
+# Running, but will not come back after a node reboot. Only an explicit
+# boot.autostart=false: an unset value means "restore the state at shutdown",
+# and such an instance does come back. Without this check a running instance
+# with false - a restore probe kept on purpose, a copy someone started by
+# hand - goes down with the next reboot, and the report above stays silent
+# because it only catches the first case. Temporary instances
+# (user.zk2.ephemeral) are exempt: they get false on purpose and live hours.
+while read -r name; do
+    add "instance ${name}: running, but boot.autostart=false - it will not start after a node reboot (incus config set ${name} boot.autostart=true)"
+done < <(jq -r '.[] | select(.expanded_config["boot.autostart"] == "false"
+                             and .status == "Running"
+                             and (.config["user.zk2.ephemeral"] // "") == "") | .name' <<<"$instances")
 
 # --------------------------------------------------------------------------
 # Kernel and the ZFS module
