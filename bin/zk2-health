@@ -24,6 +24,7 @@
 #   ZFS_POOL       pool that must exist (all pools are checked regardless)
 #   POOL_PCT       pool usage threshold, % (85)
 #   MEM_PCT        instance memory usage threshold, % of its limit (90)
+#   MEM_STALL_MS   memory stall that makes limit hits worth a line, ms (1000)
 #   NGINX_CT       front instance with Let's Encrypt certificates (nginx)
 #   CERT_DAYS      warn when a front certificate expires sooner (14)
 #   VPN_CT         OpenVPN instance (openvpn)
@@ -51,6 +52,7 @@ zk2_net_defaults
 ZFS_POOL=${ZFS_POOL:-}
 POOL_PCT=${POOL_PCT:-85}
 MEM_PCT=${MEM_PCT:-90}
+MEM_STALL_MS=${MEM_STALL_MS:-1000}
 NGINX_CT=${NGINX_CT:-nginx}
 CERT_DAYS=${CERT_DAYS:-14}
 VPN_CT=${VPN_CT:-openvpn}
@@ -196,6 +198,18 @@ fi
 # The counters grow from the container start and never reset, so only the
 # GROWTH since the previous run is reported. The same line every night for
 # months teaches you to skip the whole mail.
+#
+# "max" also grows on every page cache eviction at the limit: an instance
+# that reads and writes a lot fills its limit with cache, and from then on
+# the kernel evicts it on every write. That is normal work, not a shortage -
+# one deploy pulling nine images took "max" from 11 to 1858 with no kills,
+# while PSI showed 0.74 s of full stall over five days. So limit hits are
+# reported only when "full total" in memory.pressure - the time ALL running
+# tasks of the instance waited for memory - grew by MEM_STALL_MS or more
+# since the previous run. "full", not "some": "some" adds up seconds on
+# cache eviction too. No PSI in the kernel, or no previous value (the first
+# run after upgrading) - hits are reported as before: an extra line is
+# better than one silently skipped. Kills are always reported.
 # --------------------------------------------------------------------------
 
 prev_state=""
@@ -209,13 +223,27 @@ while IFS=$'\t' read -r name lim; do
         oom=$(awk '$1 == "oom_kill" { print $2 }' "${cg}/memory.events.local")
         all_oom=$(awk '$1 == "oom_kill" { print $2 }' "${cg}/memory.events")
         nested=$(( ${all_oom:-0} - ${oom:-0} ))
-        new_state+="${name} ${hits:-0} ${oom:-0} ${nested}"$'\n'
+        # Microseconds; empty without PSI.
+        stall=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if (sub(/^total=/, "", $i)) print $i }' \
+            "${cg}/memory.pressure" 2>/dev/null || true)
+        new_state+="${name} ${hits:-0} ${oom:-0} ${nested} ${stall:--}"$'\n'
 
         # No line yet for a new instance: read fails, and under set -e that
         # would end the whole report.
-        read -r was was_oom was_nested < <(awk -v n="$name" '$1 == n { print $2, $3, $4 }' <<<"$prev_state") || true
-        [ "${hits:-0}" -gt "${was:-0}" ] \
-            && add "instance ${name}: hit its memory limit $(( hits - ${was:-0} )) more times (${hits} in total)"
+        was=""; was_oom=""; was_nested=""; was_stall=""
+        read -r was was_oom was_nested was_stall < <(awk -v n="$name" '$1 == n { print $2, $3, $4, $5 }' <<<"$prev_state") || true
+        if [ "${hits:-0}" -gt "${was:-0}" ]; then
+            msg="instance ${name}: hit its memory limit $(( hits - ${was:-0} )) more times (${hits} in total)"
+            if [ -n "$stall" ] && [[ "${was_stall:-}" =~ ^[0-9]+$ ]]; then
+                # A smaller total means the instance restarted and PSI began
+                # from zero.
+                d=$(( stall >= was_stall ? stall - was_stall : stall ))
+                [ $(( d / 1000 )) -ge "$MEM_STALL_MS" ] \
+                    && add "${msg}, tasks waited for memory $(( d / 1000000 )).$(( d / 100000 % 10 )) s"
+            else
+                add "$msg"
+            fi
+        fi
         [ "${oom:-0}" -gt "${was_oom:-0}" ] \
             && add "INSTANCE ${name}: processes killed for lack of memory, $(( oom - ${was_oom:-0} )) more (${oom} in total)"
         case " ${NESTED_OOM_OK:-} " in

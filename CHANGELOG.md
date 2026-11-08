@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `zk2-health`: memory limit hits are reported only when the instance's
+  tasks actually waited for memory (PSI `full`, `MEM_STALL_MS`, 1 s by
+  default). Page cache eviction at the limit counts as a hit too and used to
+  produce thousands of them with no shortage at all. Kills are reported as
+  before.
 - `zk2-health`: a running instance with an explicit `boot.autostart=false`
   is now reported - it would not come back after a node reboot. Temporary
   instances (`user.zk2.ephemeral`) are exempt.
