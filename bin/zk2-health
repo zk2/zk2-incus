@@ -23,7 +23,8 @@
 # Settings, all optional, in node.conf:
 #   ZFS_POOL       pool that must exist (all pools are checked regardless)
 #   POOL_PCT       pool usage threshold, % (85)
-#   MEM_PCT        instance memory usage threshold, % of its limit (90)
+#   MEM_PCT        instance memory usage threshold, % of its limit, without
+#                  reclaimable cache (90)
 #   MEM_STALL_MS   memory stall that makes limit hits worth a line, ms (1000)
 #   NGINX_CT       front instance with Let's Encrypt certificates (nginx)
 #   CERT_DAYS      warn when a front certificate expires sooner (14)
@@ -265,8 +266,31 @@ while IFS=$'\t' read -r name lim; do
         # skipped silently is indistinguishable from a check passed.
         add "instance ${name}: memory limit '${lim}' not understood, usage not checked"
     elif [ "${used:-0}" -gt 0 ]; then
+        # memory.usage is the cgroup's memory.current, and it includes what
+        # the kernel gives back on demand: page cache ("file" minus "shmem" -
+        # shmem is counted in file but stays put without swap) and
+        # slab_reclaimable (dentries and inodes). An instance that writes a
+        # lot fills its limit with these sooner or later, and this check used
+        # to report a shortage where there was none: a container at 93% of
+        # 8GiB had 3.4 GiB it could not give back, 2.56 GiB of reclaimable
+        # slab came from overlay layers of short-lived CI containers, and PSI
+        # stayed at zero. So the threshold applies to usage WITHOUT the
+        # reclaimable part, and the full figure goes next to it. No
+        # memory.stat (a VM) - counted as before: an extra line is better
+        # than one silently skipped. printf "%.0f": mawk prints large numbers
+        # with %.6g.
+        rcl=$(awk '$1 == "file" { f = $2 } $1 == "shmem" { s = $2 }
+                   $1 == "slab_reclaimable" { r = $2 }
+                   END { if (f != "" && r != "") printf "%.0f\n", f - s + r }' \
+              "${cg}/memory.stat" 2>/dev/null || true)
         pct=$(( used * 100 / tot ))
-        [ "$pct" -ge "$MEM_PCT" ] && add "instance ${name}: using ${pct}% of its memory limit (${lim})"
+        if [[ "${rcl:-}" =~ ^[0-9]+$ ]] && [ "$rcl" -lt "$used" ]; then
+            net=$(( (used - rcl) * 100 / tot ))
+            [ "$net" -ge "$MEM_PCT" ] \
+                && add "instance ${name}: using ${net}% of its memory limit (${lim}) without reclaimable cache, ${pct}% with it"
+        else
+            [ "$pct" -ge "$MEM_PCT" ] && add "instance ${name}: using ${pct}% of its memory limit (${lim})"
+        fi
     fi
 done < <(jq -r '.[] | select(.status == "Running")
                 | [.name, (.expanded_config["limits.memory"] // "-")] | @tsv' <<<"$instances")

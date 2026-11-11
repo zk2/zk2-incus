@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `zk2-health`: memory usage against the limit (`MEM_PCT`) no longer counts
+  reclaimable page cache and slab (`file` minus `shmem`, plus
+  `slab_reclaimable` from the container's `memory.stat`). A container running
+  CI with short-lived docker containers sat at 93% of its limit with only 42%
+  it could not give back. The line shows both figures; VMs are counted as
+  before.
 - `zk2-health`: memory limit hits are reported only when the instance's
   tasks actually waited for memory (PSI `full`, `MEM_STALL_MS`, 1 s by
   default). Page cache eviction at the limit counts as a hit too and used to
